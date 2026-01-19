@@ -14,6 +14,7 @@ def build_graph(window_df):
     
     # Map 'Player Name' -> 'Node Index' (0, 1, 2...)
     player_to_idx = {name: i for i, name in enumerate(unique_players)}
+    # print(player_to_idx)
     
     # 2. CREATE NODE FEATURES (Average Position)
     # Shape: [Num_Nodes, 2] -> (x, y)

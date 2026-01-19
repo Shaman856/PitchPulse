@@ -2,104 +2,142 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import time
+
+# Import your modules
 from data_pipeline import fetch_match_data
 from window_slicer import get_rolling_windows
 from graph_builder import build_graph
 from model import PitchPulseGAT
 
-# --- 1. Helper: Calculate the Target (y) ---
-def calculate_progress_label(window_df):
-    """
-    Calculates a proxy for xT: 'Cumulative Pass Progression'.
-    How much closer did the team get to the goal (120, 40) in this window?
-    """
-    goal_x, goal_y = 120.0, 40.0
-    total_progress = 0.0
+# --- 1. The "Judge": Composite Threat Score ---
+# (Same logic as before, just kept here for completeness)
+def calculate_threat_label(window_bundle):
+    passes = window_bundle['passes']
+    shots = window_bundle['shots']
     
-    for _, row in window_df.iterrows():
-        # Distance from start of pass to goal
-        dist_start = np.sqrt((goal_x - row['x'])**2 + (goal_y - row['y'])**2)
-        
-        # Distance from end of pass (recipient) to goal
-        # Note: We need end_x/end_y. StatsBomb stores this in 'pass_end_location' usually,
-        # but for this simple proxy, let's assume successful passes reduce distance.
-        # We'll rely on the fact that we filtered for successful passes or use a simplified metric.
-        
-        # SIMPLIFIED PROXY:
-        # Just summing up "Forward Movement" (End X - Start X) for now
-        # Ideally, you'd extract 'pass_end_location' in data_pipeline.py
-        # But let's use the graph structure: 
-        # The model predicts the POTENTIAL of the shape.
-        
-        # Let's use a dummy random target for the FIRST run to test the loop,
-        # OR better: Use the number of passes into the final third (x > 80).
-        if row['x'] > 80: 
-            total_progress += 1.0
+    GOAL_X, GOAL_Y = 120.0, 40.0
+    score = 0.0
+    
+    # A. Progression
+    for _, row in passes.iterrows():
+        dist_start = np.sqrt((GOAL_X - row['x'])**2 + (GOAL_Y - row['y'])**2)
+        dist_end = np.sqrt((GOAL_X - row['end_x'])**2 + (GOAL_Y - row['end_y'])**2)
+        progression = dist_start - dist_end
+        if progression > 0:
+            score += progression
             
-    # Normalize: A score of 10.0 is "Very High Threat"
-    return torch.tensor([total_progress], dtype=torch.float)
+    # B. Outcomes
+    num_shots = len(shots)
+    num_goals = len(shots[shots['is_goal'] == True])
+    score += (num_shots * 20.0) + (num_goals * 50.0)
+    
+    return torch.tensor([score / 100.0], dtype=torch.float)
 
-# --- 2. The Training Function ---
-def train_one_match(match_id, model, optimizer, criterion, device):
-    # A. Get Data
-    df = fetch_match_data(match_id)
-    windows = get_rolling_windows(df)
+# --- 2. NEW Helper: Prepare the Dataset in RAM ---
+def prepare_dataset(windows, device):
+    """
+    Converts raw DataFrame windows into a list of (Graph, Label) tuples.
+    This runs ONCE before training starts.
+    """
+    dataset = []
+    print(f"   > Pre-processing {len(windows)} windows into Graphs...")
     
-    total_loss = 0
-    model.train() # Set model to training mode
-    
-    # B. Loop through windows
     for window in windows:
-        # 1. Build Graph (Input X)
-        data = build_graph(window)
-        data.batch = torch.zeros(data.num_nodes, dtype=torch.long) # Batch vector
-        data = data.to(device)
+        try:
+            # 1. Build Graph (Input X)
+            graph_data = build_graph(window['passes'])
+            
+            # Prepare Batch Vector (Needed for single graph processing)
+            graph_data.batch = torch.zeros(graph_data.num_nodes, dtype=torch.long)
+            
+            # Move to GPU immediately (If your VRAM allows - 1 match is tiny, so yes)
+            graph_data = graph_data.to(device)
+            
+            # 2. Build Label (Target y)
+            label = calculate_threat_label(window).to(device)
+            
+            # Store tuple
+            dataset.append((graph_data, label))
+            
+        except ValueError:
+            # Skip empty/invalid windows
+            continue
+            
+    print(f"   > Dataset Ready: {len(dataset)} valid training samples.")
+    return dataset
+
+# --- 3. Optimized Training Loop ---
+def train_one_epoch(dataset, model, optimizer, criterion):
+    """
+    Iterates over the pre-loaded dataset. No fetching, no building. Just math.
+    """
+    model.train()
+    total_loss = 0
+    
+    for graph_data, label in dataset:
+        optimizer.zero_grad()
         
-        # 2. Calculate Label (Target y)
-        # We want the model to predict how dangerous this window WAS.
-        label = calculate_progress_label(window).to(device)
+        # Forward Pass
+        prediction = model(graph_data)
         
-        # 3. Forward Pass
-        optimizer.zero_grad() # Reset gradients
-        prediction = model(data)
-        
-        # 4. Calculate Loss (Error)
+        # Loss & Backprop
         loss = criterion(prediction, label)
-        
-        # 5. Backpropagation (Learn)
         loss.backward()
         optimizer.step()
         
         total_loss += loss.item()
         
-    return total_loss / len(windows)
+    return total_loss / len(dataset)
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    # Setup Device (RTX 3060)
+    # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Training on: {device}")
+    print(f"Device: {device}")
     
-    # Initialize Model
     model = PitchPulseGAT().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.01) # Learning Rate
-    criterion = nn.MSELoss() # Mean Squared Error (Standard for Regression)
+    optimizer = optim.Adam(model.parameters(), lr=0.005)
+    criterion = nn.MSELoss()
     
-    # Training Loop (Over 1 Match for demonstration)
-    # In reality, you'd loop over your 3,464 matches here [cite: 51]
     match_id = 8658
     
-    print(f"\n--- Starting Training on Match {match_id} ---")
-    for epoch in range(1, 11): # Run 10 Epochs
-        avg_loss = train_one_match(match_id, model, optimizer, criterion, device)
-        print(f"Epoch {epoch} | Loss: {avg_loss:.4f}")
+    # --- STEP 1: LOAD & PROCESS DATA (ONCE) ---
+    print(f"\n--- Phase 1: Data Preparation ---")
+    start_time = time.time()
+    
+    # A. Fetch
+    data = fetch_match_data(match_id)
+    
+    # B. Slice
+    windows = get_rolling_windows(data)
+    
+    # C. Convert to Tensors (The Level 2 Optimization)
+    train_dataset = prepare_dataset(windows, device)
+    
+    print(f"Data Prep Time: {time.time() - start_time:.2f} seconds")
+    
+    # --- STEP 2: TRAINING LOOP (FAST) ---
+    print(f"\n--- Phase 2: Training Loop ---")
+    
+    for epoch in range(1, 11):
+        # We pass the pre-built 'train_dataset' instead of match_id
+        avg_loss = train_one_epoch(train_dataset, model, optimizer, criterion)
+        print(f"Epoch {epoch:02d} | Loss: {avg_loss:.4f}")
         
     print("\n--- Training Complete! ---")
     
-    # Test Prediction
-    print("Testing on a sample window...")
+    # --- STEP 3: TESTING ---
+    # We can just grab the goal window from our RAM dataset
+    # (Assuming we know the index, usually the high scoring one)
+    print("Testing on a High-Threat Sample (from RAM)...")
     model.eval()
-    dummy_data = build_graph(get_rolling_windows(fetch_match_data(match_id))[15]).to(device)
-    dummy_data.batch = torch.zeros(dummy_data.num_nodes, dtype=torch.long).to(device)
-    pred = model(dummy_data)
-    print(f"Predicted Threat Score: {pred.item():.4f}")
+    
+    # Let's find the sample with the highest label in our dataset
+    best_sample = max(train_dataset, key=lambda x: x[1].item())
+    
+    input_graph, true_label = best_sample
+    pred = model(input_graph)
+    
+    print(f"Actual Score:    {true_label.item():.4f}")
+    print(f"Predicted Score: {pred.item():.4f}")
