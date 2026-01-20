@@ -66,12 +66,16 @@ def visualize_attention(match_id, window_idx=None):
     # Normalize for Plotting (Make the differences pop)
     att_scores = (att_scores - att_scores.min()) / (att_scores.max() - att_scores.min())
     
-    # 6. Plotting
+   # 6. Plotting
     G = to_networkx(graph_data, to_undirected=False)
     pos = {}
     for i, (x, y) in enumerate(graph_data.x):
+        # FIX: Un-normalize the coordinates back to 120x80 scale
+        real_x = x.item() * 120
+        real_y = y.item() * 80
+        
         # Flip Y for plotting so it looks like a TV broadcast
-        pos[i] = (x.item(), 80 - y.item()) 
+        pos[i] = (real_x, 80 - real_y)
         
     plt.figure(figsize=(12, 8))
     plt.xlim(-5, 125)
