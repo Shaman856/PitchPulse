@@ -24,7 +24,8 @@ def visualize_attention(match_id, window_idx=None):
     
     if os.path.exists(CHECKPOINT_PATH):
         print(f"Loading weights from {CHECKPOINT_PATH}...")
-        model.load_state_dict(torch.load(CHECKPOINT_PATH))
+        # FIX: Add map_location=device to handle loading GPU models on Mac/CPU
+        model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
     else:
         print("Warning: No checkpoint found! Using random weights (bad).")
         
