@@ -11,23 +11,45 @@ from statsbombpy import sb
 from data_pipeline import fetch_match_data
 from window_slicer import get_rolling_windows
 from graph_builder import build_graph
-from model_visualize import PitchPulseGAT
+from model import PitchPulseGAT
 
 # --- CONFIGURATION ---
 # Add more competitions here if you want.
 # (Comp ID, Season ID)
 # 43=World Cup, 55=Euro, 11=La Liga
+
+
+# TARGET_COMPETITIONS = [
+#     # --- MEN'S INTERNATIONAL ---
+#     (43, 106), # World Cup 2022 (64 matches)
+#     (43, 3),   # World Cup 2018 (64 matches)
+#     (43, 51),  # World Cup 2014 (64 matches)
+#     (55, 43),  # Euro 2020 (51 matches)
+
+#     # --- MEN'S CLUB (Messi Data) ---
+#     (11, 90),  # La Liga 20/21 (35 matches)
+#     (11, 42),  # La Liga 19/20 (33 matches)
+#     (11, 4),   # La Liga 18/19 (34 matches)
+#     (11, 1),   # La Liga 17/18 (36 matches)
+
+#     # --- WOMEN'S CLUB (FULL SEASONS - The Data Goldmine) ---
+#     (37, 90),  # FA Women's Super League 2020/2021 (~132 matches)
+#     (37, 42),  # FA Women's Super League 2019/2020 (~87 matches)
+#     (37, 4),   # FA Women's Super League 2018/2019 (~108 matches)
+    
+#     # --- CHAMPIONS LEAGUE (High Quality) ---
+#     (16, 4),   # Champions League 18/19 (13 matches - Finals/Semis)
+#     (16, 1),   # Champions League 17/18 (13 matches)
+# ]
+
 TARGET_COMPETITIONS = [
-    (43, 106), # World Cup 2022
-    (43, 3),   # World Cup 2018
-    (55, 43),  # Euro 2020
-    (11, 90),  # La Liga 20/21 (Messi's last season)
-    (11, 42),  # La Liga 19/20
+    (16, 4),   # Champions League 18/19 (13 matches - Finals/Semis)
+    (16, 1),   # Champions League 17/18 (13 matches)
 ]
 
-EPOCHS = 50  # Deep training
-SAVE_DIR = "checkpoints"
-LOG_FILE = "training_log.txt"
+EPOCHS = 20  # Deep training
+SAVE_DIR = "checkpoints2"
+LOG_FILE = "training_log2.txt"
 
 # --- 1. Helper Functions (Same as before) ---
 def log(message):
@@ -85,6 +107,8 @@ if __name__ == "__main__":
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     log(f"Device: {device}")
+    if device.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
     
     # --- PHASE 1: GATHER MATCH IDs ---
     all_match_ids = []

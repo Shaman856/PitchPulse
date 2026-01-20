@@ -9,7 +9,7 @@ import os
 from data_pipeline import fetch_match_data
 from window_slicer import get_rolling_windows
 from graph_builder import build_graph
-from model2 import PitchPulseGAT
+from model import PitchPulseGAT
 
 # --- CONFIG ---
 CHECKPOINT_PATH = "checkpoints/best_model.pth"  # Point to your new brain
