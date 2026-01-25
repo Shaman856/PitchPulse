@@ -1,143 +1,140 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
+from torch_geometric.loader import DataLoader
+from torch.utils.data import random_split
+import matplotlib.pyplot as plt
 import numpy as np
-import time
+from tqdm import tqdm
 
-# Import your modules
-from data_pipeline import fetch_match_data
-from window_slicer import get_rolling_windows
-from graph_builder import build_graph
-from model import PitchPulseGAT
+# --- IMPORTS ---
+from dataset import TacticalDataset
+from model import TacticalGAT
 
-# --- 1. The "Judge": Composite Threat Score ---
-# (Same logic as before, just kept here for completeness)
-def calculate_threat_label(window_bundle):
-    passes = window_bundle['passes']
-    shots = window_bundle['shots']
-    
-    GOAL_X, GOAL_Y = 120.0, 40.0
-    score = 0.0
-    
-    # A. Progression
-    for _, row in passes.iterrows():
-        dist_start = np.sqrt((GOAL_X - row['x'])**2 + (GOAL_Y - row['y'])**2)
-        dist_end = np.sqrt((GOAL_X - row['end_x'])**2 + (GOAL_Y - row['end_y'])**2)
-        progression = dist_start - dist_end
-        if progression > 0:
-            score += progression
-            
-    # B. Outcomes
-    num_shots = len(shots)
-    num_goals = len(shots[shots['is_goal'] == True])
-    score += (num_shots * 20.0) + (num_goals * 50.0)
-    
-    return torch.tensor([score / 100.0], dtype=torch.float)
+# --- CONFIGURATION ---
+DATASET_PATH = "./data_v2" 
+DATASET_NAME = "international_mix"
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
+EPOCHS = 30
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+GRADIENT_CLIP = 1.0 # NEW: Prevents exploding gradients from the 20x xG weight
 
-# --- 2. NEW Helper: Prepare the Dataset in RAM ---
-def prepare_dataset(windows, device):
+# --- WEIGHTED LOSS CONFIGURATION ---
+# Index 0: xG (Weight 20.0) - The most critical metric
+# Index 1: Press Height (Weight 1.0)
+# Index 2: Field Tilt (Weight 1.0)
+# Index 3: Verticality (Weight 1.5)
+LOSS_WEIGHTS = torch.tensor([20.0, 1.0, 1.0, 1.5]).to(DEVICE)
+
+def weighted_mse_loss(input, target, weights):
     """
-    Converts raw DataFrame windows into a list of (Graph, Label) tuples.
-    This runs ONCE before training starts.
+    Custom Loss: (Prediction - Target)^2 * Weight
     """
-    dataset = []
-    print(f"   > Pre-processing {len(windows)} windows into Graphs...")
-    
-    for window in windows:
-        try:
-            # 1. Build Graph (Input X)
-            graph_data = build_graph(window['passes'])
-            
-            # Prepare Batch Vector (Needed for single graph processing)
-            graph_data.batch = torch.zeros(graph_data.num_nodes, dtype=torch.long)
-            
-            # Move to GPU immediately (If your VRAM allows - 1 match is tiny, so yes)
-            graph_data = graph_data.to(device)
-            
-            # 2. Build Label (Target y)
-            label = calculate_threat_label(window).to(device)
-            
-            # Store tuple
-            dataset.append((graph_data, label))
-            
-        except ValueError:
-            # Skip empty/invalid windows
-            continue
-            
-    print(f"   > Dataset Ready: {len(dataset)} valid training samples.")
-    return dataset
+    loss = (input - target) ** 2
+    weighted_loss = loss * weights
+    return weighted_loss.mean()
 
-# --- 3. Optimized Training Loop ---
-def train_one_epoch(dataset, model, optimizer, criterion):
-    """
-    Iterates over the pre-loaded dataset. No fetching, no building. Just math.
-    """
-    model.train()
-    total_loss = 0
+def train():
+    print(f"--- STARTING TRAINING ON {DEVICE} ---")
     
-    for graph_data, label in dataset:
-        optimizer.zero_grad()
+    # 1. Load Data
+    print("Loading Dataset...")
+    # NOTE: Ensure window_size/stride match what you generated in dataset.py
+    dataset = TacticalDataset(root=DATASET_PATH, competitions=[], dataset_name=DATASET_NAME, window_size=5, stride=1)
+    
+    # 2. Split (80% Train, 20% Test)
+    torch.manual_seed(42)
+    train_size = int(0.8 * len(dataset))
+    test_size = len(dataset) - train_size
+    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+    
+    print(f"Train Samples: {len(train_dataset)} | Test Samples: {len(test_dataset)}")
+    
+    # 3. Data Loaders
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    
+    # 4. Initialize Model
+    model = TacticalGAT(num_node_features=3, num_classes=4).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    
+    # Metrics Tracking
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    
+    # --- TRAINING LOOP ---
+    for epoch in range(EPOCHS):
+        model.train()
+        total_train_loss = 0
         
-        # Forward Pass
-        prediction = model(graph_data)
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False)
         
-        # Loss & Backprop
-        loss = criterion(prediction, label)
-        loss.backward()
-        optimizer.step()
+        for batch in loop:
+            batch = batch.to(DEVICE)
+            
+            # Forward
+            out = model(batch)
+            
+            # FIX 1: Robust Reshaping
+            # Ensure target is exactly [Batch_Size, 4] regardless of input oddities
+            target = batch.y.view(-1, 4)
+            
+            # Calculate Loss
+            loss = weighted_mse_loss(out, target, LOSS_WEIGHTS)
+            
+            # Backward
+            optimizer.zero_grad()
+            loss.backward()
+            
+            # FIX 2: Gradient Clipping
+            # Prevents the "Exploding Gradient" from the high xG weight
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRADIENT_CLIP)
+            
+            optimizer.step()
+            
+            total_train_loss += loss.item()
+            loop.set_postfix(loss=loss.item())
+            
+        avg_train_loss = total_train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
         
-        total_loss += loss.item()
+        # --- VALIDATION LOOP ---
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for batch in test_loader:
+                batch = batch.to(DEVICE)
+                out = model(batch)
+                
+                # Apply same Shape Safety in validation
+                target = batch.y.view(-1, 4)
+                
+                loss = weighted_mse_loss(out, target, LOSS_WEIGHTS)
+                total_val_loss += loss.item()
+                
+        avg_val_loss = total_val_loss / len(test_loader)
+        val_losses.append(avg_val_loss)
         
-    return total_loss / len(dataset)
+        print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        
+        # Save Best Model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), "best_model.pth")
+            print("   -> New Best Model Saved!")
 
-# --- Main Execution ---
+    # --- PLOT RESULTS ---
+    print("\nTraining Complete. Plotting Loss Curve...")
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.title(f'Tactical GAT Training (Weighted xG={LOSS_WEIGHTS[0].item()})')
+    plt.xlabel('Epochs')
+    plt.ylabel('Weighted MSE Loss')
+    plt.legend()
+    plt.savefig('training_curve.png')
+    plt.show()
+
 if __name__ == "__main__":
-    # Setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-    
-    model = PitchPulseGAT().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.005)
-    criterion = nn.MSELoss()
-    
-    match_id = 8658
-    
-    # --- STEP 1: LOAD & PROCESS DATA (ONCE) ---
-    print(f"\n--- Phase 1: Data Preparation ---")
-    start_time = time.time()
-    
-    # A. Fetch
-    data = fetch_match_data(match_id)
-    
-    # B. Slice
-    windows = get_rolling_windows(data)
-    
-    # C. Convert to Tensors (The Level 2 Optimization)
-    train_dataset = prepare_dataset(windows, device)
-    
-    print(f"Data Prep Time: {time.time() - start_time:.2f} seconds")
-    
-    # --- STEP 2: TRAINING LOOP (FAST) ---
-    print(f"\n--- Phase 2: Training Loop ---")
-    
-    for epoch in range(1, 11):
-        # We pass the pre-built 'train_dataset' instead of match_id
-        avg_loss = train_one_epoch(train_dataset, model, optimizer, criterion)
-        print(f"Epoch {epoch:02d} | Loss: {avg_loss:.4f}")
-        
-    print("\n--- Training Complete! ---")
-    
-    # --- STEP 3: TESTING ---
-    # We can just grab the goal window from our RAM dataset
-    # (Assuming we know the index, usually the high scoring one)
-    print("Testing on a High-Threat Sample (from RAM)...")
-    model.eval()
-    
-    # Let's find the sample with the highest label in our dataset
-    best_sample = max(train_dataset, key=lambda x: x[1].item())
-    
-    input_graph, true_label = best_sample
-    pred = model(input_graph)
-    
-    print(f"Actual Score:    {true_label.item():.4f}")
-    print(f"Predicted Score: {pred.item():.4f}")
+    train()

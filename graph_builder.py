@@ -1,101 +1,174 @@
 import torch
-from torch_geometric.data import Data
 import pandas as pd
 import numpy as np
-
-import torch
 from torch_geometric.data import Data
-import pandas as pd
-import numpy as np
 
-def build_graph(window_df):
+# --- CONFIGURATION ---
+# Fixed 12-Node structure.
+# (Node definitions are handled in utils.py, here we just respect the count)
+NUM_NODES = 12 
+DEFAULT_POSITIONS = {
+    0: [0.05, 0.50], # GK (Goal line, center)
+    1: [0.25, 0.10], # LB (Defensive third, left)
+    2: [0.20, 0.35], # CB_L (Defensive third, left-center)
+    3: [0.20, 0.65], # CB_R (Defensive third, right-center)
+    4: [0.25, 0.90], # RB (Defensive third, right)
+    5: [0.40, 0.50], # DM (Midfield circle, deep)
+    6: [0.55, 0.30], # CM_L (Midfield, left)
+    7: [0.55, 0.70], # CM_R (Midfield, right)
+    8: [0.70, 0.50], # AM (Attacking third, center)
+    9: [0.75, 0.15], # LW (Attacking third, wide left)
+    10:[0.75, 0.85], # RW (Attacking third, wide right)
+    11:[0.85, 0.50]  # ST (Opponent box, center)
+}
+
+def build_graph_from_window(window):
     """
-    Converts a 15-minute window DataFrame into a PyTorch Geometric Graph.
-    Nodes: Any player involved (Sender OR Receiver).
+    Converts a Window Bundle (Passes + Labels) into a PyTorch Geometric Data object.
+    
+    Features:
+    1. Fixed 12-Node Topology (GK to Striker).
+    2. Sequence-based Edges (Pass i -> Pass i+1).
+    3. Ghost Pass Fix (Checks Possession ID chain).
+    4. Context-Aware (Global Opponent Density).
     """
-    # --- 1. IDENTIFY NODES (Sender AND Receiver) ---
-    senders = window_df['player'].dropna().unique()
-    receivers = window_df['pass_recipient'].dropna().unique()
     
-    # Union of both sets = All active players
-    unique_players = list(set(senders) | set(receivers))
+    # 1. Unpack the Bundle
+    passes = window['passes'].copy()
+    opp_def = window['opp_defense']
     
-    if len(unique_players) == 0:
-        # Handle empty window (rare but possible)
-        return Data(x=torch.zeros((0, 2)), edge_index=torch.zeros((2, 0), dtype=torch.long))
+    # --- 2. NODE FEATURES (x) ---
+    # Shape: [12, 3] -> [Active?, Avg_X, Avg_Y]
+    # We rely on 'node_idx' created by utils.encode_features
+    if 'node_idx' not in passes.columns:
+        raise ValueError("Critical: 'node_idx' missing. Please run utils.encode_features() before slicing.")
 
-    # Map 'Player Name' -> 'Node Index'
-    player_to_idx = {name: i for i, name in enumerate(unique_players)}
+    node_features = np.zeros((NUM_NODES, 3)) 
+
+    # 1. Pre-fill with Defaults (The "Ghost" Structure)
+    # This ensures that if a player is silent, they stay in position visually
+    for i in range(NUM_NODES):
+        def_x, def_y = DEFAULT_POSITIONS[i]
+        node_features[i, 0] = 0.0   # Active = 0 (Silent)
+        node_features[i, 1] = def_x # Default X
+        node_features[i, 2] = def_y # Default Y
     
-    # --- 2. NODE FEATURES (Average Position) ---
-    node_features = []
+    # Aggregate stats per Tactical Role
+    grouped = passes.groupby('node_idx')
+    for node_idx, data in grouped:
+        if 0 <= node_idx < NUM_NODES:
+            node_features[node_idx, 0] = 1.0 # Feature 0: Active in this window
+            node_features[node_idx, 1] = data['x'].mean() / 120.0 # Feature 1: Normalized X
+            node_features[node_idx, 2] = data['y'].mean() / 80.0  # Feature 2: Normalized Y
+
+    x_tensor = torch.tensor(node_features, dtype=torch.float)
+
+    # --- 3. EDGE CONSTRUCTION (Sequence & Flow) ---
+    # Logic: Connect Pass(i) -> Pass(i+1) if they belong to the same possession chain.
     
-    for player in unique_players:
-        # Get all actions involving this player (as sender) to determine position
-        # If they only received (never sent), we estimate pos from where they received
-        p_sent = window_df[window_df['player'] == player]
-        p_received = window_df[window_df['pass_recipient'] == player]
+    edge_sources = []
+    edge_targets = []
+    edge_attrs = []
+    
+    # Sort chronologically to establish flow
+    sorted_passes = passes.sort_values('time_min')
+    node_indices = sorted_passes['node_idx'].values
+    
+    # Extract Edge Features (Safe Access with defaults)
+    p_len = sorted_passes['pass_length'].values if 'pass_length' in passes else np.zeros(len(passes))
+    p_ang = sorted_passes['pass_angle'].values if 'pass_angle' in passes else np.zeros(len(passes))
+    p_pres = sorted_passes['pressure_code'].values if 'pressure_code' in passes else np.zeros(len(passes))
+    
+    # Extract Possession ID (Critical for Ghost Pass Fix)
+    # If missing (user didn't update pipeline), default to 0s (Logic degrades gracefully but loses fix)
+    poss_ids = sorted_passes['possession'].values if 'possession' in passes else np.zeros(len(passes))
+    
+    for i in range(len(sorted_passes) - 1):
+        src = node_indices[i]
+        dst = node_indices[i+1]
         
-        if not p_sent.empty:
-            avg_x = p_sent['x'].mean()
-            avg_y = p_sent['y'].mean()
-        elif not p_received.empty:
-            # Use end location of passes sent TO them
-            avg_x = p_received['end_x'].mean()
-            avg_y = p_received['end_y'].mean()
-        else:
-            avg_x, avg_y = 60.0, 40.0 # Fallback (Midfield)
-
-        # Normalize (120x80 pitch)
-        node_features.append([avg_x / 120.0, avg_y / 80.0])
-
-    x = torch.tensor(node_features, dtype=torch.float)
-
-    # --- 3. EDGES (Passes) ---
-    source_nodes = []
-    target_nodes = []
-    
-    for _, row in window_df.iterrows():
-        sender = row['player']
-        receiver = row['pass_recipient']
-        
-        # Now this check will pass for Strikers too!
-        if pd.notna(receiver) and sender in player_to_idx and receiver in player_to_idx:
-            src_idx = player_to_idx[sender]
-            tgt_idx = player_to_idx[receiver]
+        # EDGE VALIDATION LOGIC:
+        # 1. Source and Target must be valid 0-11 Roles (No unknown/subs)
+        # 2. Must be part of the SAME possession chain (Fixes "Teleporting" edges)
+        if (src < NUM_NODES and dst < NUM_NODES) and (poss_ids[i] == poss_ids[i+1]):
             
-            source_nodes.append(src_idx)
-            target_nodes.append(tgt_idx)
+            edge_sources.append(src)
+            edge_targets.append(dst)
             
-    # Safety: Handle windows with 0 edges
-    if len(source_nodes) == 0:
-        edge_index = torch.zeros((2, 0), dtype=torch.long)
+            # Edge Attributes: [Normalized Length, Normalized Angle, Pressure Binary]
+            attr = [
+                p_len[i] / 120.0,  
+                p_ang[i] / 3.14,   
+                float(p_pres[i])   
+            ]
+            edge_attrs.append(attr)
+            
+    # Handle rare case of 0 edges (e.g., 1 pass in whole window)
+    if len(edge_sources) == 0:
+        edge_index = torch.tensor([[0], [0]], dtype=torch.long)
+        edge_attr = torch.tensor([[0, 0, 0]], dtype=torch.float)
     else:
-        edge_index = torch.tensor([source_nodes, target_nodes], dtype=torch.long)
+        edge_index = torch.tensor([edge_sources, edge_targets], dtype=torch.long)
+        edge_attr = torch.tensor(edge_attrs, dtype=torch.float)
+
+    # --- 4. GLOBAL CONTEXT (u) ---
+    # Feature: Opponent Defensive Density (Actions per Minute)
+    duration = window['end_time'] - window['start_time']
+    # Avoid division by zero
+    opp_density = len(opp_def) / duration if duration > 0 else 0.0
     
-    # --- 4. DATA OBJECT ---
-    data = Data(x=x, edge_index=edge_index)
-    data.num_nodes = len(unique_players) # Explicitly set num_nodes for safety
+    # Global feature vector [1, 1]
+    u = torch.tensor([[opp_density]], dtype=torch.float)
+
+    # --- 5. TARGET LABELS (y) ---
+    # The Tactical Suite: [xG, PressHeight, Tilt, Verticality]
+    y = torch.tensor([[
+        window['y_xg'], 
+        window['y_press_height'] / 120.0, # Normalize coordinate
+        window['y_field_tilt'],
+        window['y_verticality']
+    ]], dtype=torch.float)
+
+    # --- 6. ASSEMBLE OBJECT ---
+    data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, y=y, u=u)
+    
+    # Attach Metadata (Useful for debugging/splitting later)
+    data.match_id = window.get('match_id', 0)
+    data.window_id = window['window_id']
+    data.team_name = window['team_name']
     
     return data
 
 # --- TEST BLOCK ---
 if __name__ == "__main__":
-    from data_pipeline import fetch_match_data
     from window_slicer import get_rolling_windows
+    from data_pipeline import fetch_match_data
+    from utils import encode_features
     
-    print("Fetching and Slicing Data...")
-    # 1. Get Data Bundle
-    data = fetch_match_data(8658) # France vs Croatia
-    windows = get_rolling_windows(data)
+    match_id = 8658 # World Cup Final
+    print(f"1. Fetching Match {match_id}...")
+    raw = fetch_match_data(match_id)
     
-    # 2. Select Window 5
-    print(f"\n--- Building Graph for Window 5 ---")
-    target_bundle = windows[5]
+    # CRITICAL: Encode features BEFORE slicing so 'node_idx' exists
+    if not raw['passes'].empty:
+        raw['passes'] = encode_features(raw['passes'])
     
-    # FIX IS HERE: We pass target_bundle['passes'], not just target_bundle
-    graph = build_graph(target_bundle['passes'])
+    print("2. Slicing windows...")
+    windows = get_rolling_windows(raw, match_id)
     
-    print("Graph Created Successfully!")
-    print(graph)
-    print(f"Nodes: {graph.num_nodes}, Edges: {graph.num_edges}")
+    print("3. Building Graphs...")
+    graphs = []
+    for w in windows:
+        g = build_graph_from_window(w)
+        graphs.append(g)
+        
+    print(f"Built {len(graphs)} graphs.")
+    
+    if len(graphs) > 10:
+        g = graphs[10]
+        print("\n--- Graph Inspection (Window 10) ---")
+        print(f"Team: {g.team_name} | Match: {g.match_id}")
+        print(f"Nodes (x): {g.x.shape} (Should be [12, 3])")
+        print(f"Edges: {g.edge_index.shape[1]} (Possession Chains)")
+        print(f"Global (u): {g.u.item():.4f} (Opponent Density)")
+        print(f"Targets (y): {g.y.tolist()} \n(xG, Press, Tilt, Vert)")
