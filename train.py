@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 from torch.utils.data import random_split
 import matplotlib.pyplot as plt
@@ -11,8 +10,9 @@ from dataset import TacticalDataset
 from model import TacticalGAT
 
 # --- CONFIGURATION ---
-DATASET_PATH = "./data_v2" 
-DATASET_NAME = "international_mix"
+DATASET_PATH = "./data_v3" 
+DATASET_NAME = "offline_mix"
+RAW_DATA_DIR = "./data/raw_events"
 BATCH_SIZE = 32
 LEARNING_RATE = 0.001
 EPOCHS = 30
@@ -40,7 +40,7 @@ def train():
     # 1. Load Data
     print("Loading Dataset...")
     # NOTE: Ensure window_size/stride match what you generated in dataset.py
-    dataset = TacticalDataset(root=DATASET_PATH, competitions=[], dataset_name=DATASET_NAME, window_size=5, stride=1)
+    dataset = TacticalDataset(root=DATASET_PATH, raw_dir=RAW_DATA_DIR, dataset_name=DATASET_NAME, window_size=5, stride=1)
     
     # 2. Split (80% Train, 20% Test)
     torch.manual_seed(42)
