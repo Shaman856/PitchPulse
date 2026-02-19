@@ -1,11 +1,14 @@
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import pandas as pd
 import matplotlib.pyplot as plt
 import warnings
 
 # Import your pipeline modules
-from window_slicer import get_rolling_windows
-from data_pipeline import fetch_match_data
-from utils import encode_features
+from preprocessing.window_slicer import get_rolling_windows
+from preprocessing.data_pipeline import fetch_match_data
+from preprocessing.utils import encode_features
 
 # --- CONFIGURATION ---
 MATCH_ID = 8658  # World Cup Final 2018

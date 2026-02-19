@@ -143,7 +143,7 @@ def get_rolling_windows(data_dict,match_id, window_size=5, stride=1):
 # --- Test Block ---
 if __name__ == "__main__":
     from data_pipeline import fetch_match_data
-    from utils import encode_features
+    from .utils import encode_features
     
     # 1. Fetch & Encode
     match_id = 8658 # World Cup Final

@@ -143,7 +143,7 @@ def build_graph_from_window(window):
 if __name__ == "__main__":
     from window_slicer import get_rolling_windows
     from data_pipeline import fetch_match_data
-    from utils import encode_features
+    from .utils import encode_features
     
     match_id = 8658 # World Cup Final
     print(f"1. Fetching Match {match_id}...")

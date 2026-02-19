@@ -6,8 +6,8 @@ import numpy as np
 from tqdm import tqdm
 
 # --- IMPORTS ---
-from dataset import TacticalDataset
-from model import TacticalGAT
+from preprocessing.dataset import TacticalDataset
+from models.model import TacticalGAT
 
 # --- CONFIGURATION ---
 DATASET_PATH = "./data_v3" 

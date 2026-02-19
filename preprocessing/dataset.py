@@ -7,10 +7,10 @@ from tqdm import tqdm
 
 # --- IMPORT YOUR PIPELINE MODULES ---
 # Ensure these match your local filenames
-from data_pipeline import fetch_match_data
-from utils import encode_features
-from window_slicer import get_rolling_windows
-from graph_builder import build_graph_from_window
+from .data_pipeline import fetch_match_data
+from .utils import encode_features
+from .window_slicer import get_rolling_windows
+from .graph_builder import build_graph_from_window
 
 class TacticalDataset(InMemoryDataset):
     def __init__(self, root, raw_dir, dataset_name, window_size=5, stride=1, transform=None, pre_transform=None):

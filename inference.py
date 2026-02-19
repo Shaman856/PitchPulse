@@ -4,8 +4,8 @@ from torch_geometric.loader import DataLoader
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from dataset import TacticalDataset
-from model import TacticalGAT
+from preprocessing.dataset import TacticalDataset
+from models.model import TacticalGAT
 
 # --- CONFIGURATION ---
 DATASET_PATH = "./data_v3" 
