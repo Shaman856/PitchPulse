@@ -12,6 +12,8 @@ target_features = [
 match_id = 8658
 
 events = sb.events(match_id)
+print(f"Available features: {events.columns}\n")
+
 
 print(f"Inspecting features for Match ID: {match_id}\n")
 

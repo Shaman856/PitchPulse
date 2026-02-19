@@ -1,0 +1,8 @@
+statsbombpy
+pandas
+numpy
+matplotlib
+networkx
+tqdm
+torch
+torch_geometric
