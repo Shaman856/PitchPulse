@@ -13,6 +13,7 @@ from models.model import TacticalGAT
 DATASET_PATH = "./data_v3" 
 DATASET_NAME = "offline_mix"
 RAW_DATA_DIR = "./data/raw_events"
+MAX_MATCHES = 230  # Set to None for all matches
 BATCH_SIZE = 32
 LEARNING_RATE = 0.001
 EPOCHS = 60
@@ -42,7 +43,7 @@ def train():
     
     # 1. Load Data
     print("Loading Dataset...")
-    dataset = TacticalDataset(root=DATASET_PATH, raw_dir=RAW_DATA_DIR, dataset_name=DATASET_NAME, window_size=5, stride=1)
+    dataset = TacticalDataset(root=DATASET_PATH, raw_dir=RAW_DATA_DIR, dataset_name=DATASET_NAME, window_size=5, stride=1, max_matches=MAX_MATCHES)
     
     # 2. Split (80% Train, 20% Test)
     torch.manual_seed(42)

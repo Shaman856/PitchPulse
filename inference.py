@@ -11,6 +11,7 @@ from models.model import TacticalGAT
 DATASET_PATH = "./data_v3" 
 DATASET_NAME = "offline_mix"
 RAW_DATA_DIR = "./data/raw_events"
+MAX_MATCHES = 230  # Must match train.py setting
 MODEL_PATH = "best_model.pth"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -32,7 +33,7 @@ def denormalize(preds_or_targets):
 
 def load_data_and_model():
     print("1. Loading Data...")
-    dataset = TacticalDataset(root=DATASET_PATH, raw_dir=RAW_DATA_DIR, dataset_name=DATASET_NAME, window_size=5, stride=1)
+    dataset = TacticalDataset(root=DATASET_PATH, raw_dir=RAW_DATA_DIR, dataset_name=DATASET_NAME, window_size=5, stride=1, max_matches=MAX_MATCHES)
     
     # Simulate the same split
     torch.manual_seed(42)
