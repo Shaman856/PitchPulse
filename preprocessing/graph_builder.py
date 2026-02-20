@@ -32,7 +32,7 @@ def build_graph_from_window(window):
     [4]  Forward progression   - Avg forward distance per pass
     [5]  Pressure ratio        - Fraction of passes under pressure
     [6]  Avg pass length       - Mean pass distance (normalized)
-    [7]  High pass ratio       - Fraction of passes that are aerial (from height_code)
+    [7]  High pass ratio       - Fraction of passes that are aerial
     [8]  Progressive pass ratio- Fraction of passes moving >10m forward
     [9]  Receive count         - Passes RECEIVED by this role (normalized)
     [10] Set piece ratio       - Fraction of passes from set piece situations
@@ -44,12 +44,21 @@ def build_graph_from_window(window):
     [3] Height code    (normalized: 0=Ground, 0.5=Low, 1.0=High)
     [4] Pattern code   (normalized: 0=Regular, 0.5=SetPiece, 1.0=Counter)
     
-    Global Context (5-dim):
-    [0] Opponent defensive density  (actions per minute)
-    [1] Possession share            (team passes / all passes in window)
-    [2] Team territory              (avg X of team passes, normalized)
-    [3] Counterpress intensity      (opponent counterpresses / window duration)
-    [4] Half indicator              (0 = 1st half, 1 = 2nd half)
+    Global Context (3-dim):
+    [0] Opponent defensive density
+    [1] Counterpress intensity
+    [2] Half indicator
+    
+    Targets:
+      y:        [1, 5] float - Regression targets
+                  [0] Cumulative xT (log-scaled)
+                  [1] Press Height (normalized /120)
+                  [2] Field Tilt (0-1)
+                  [3] Verticality (shifted to 0-1)
+                  [4] Tempo (normalized /30)
+      y_cls:    [1, 2] long  - Classification targets
+                  [0] Defensive Posture (0=LowBlock, 1=MidBlock, 2=HighPress)
+                  [1] Offensive Style   (0=Patient, 1=Balanced, 2=Counter)
     """
     
     # 1. Unpack the Bundle
@@ -68,7 +77,6 @@ def build_graph_from_window(window):
         node_features[i, 0] = 0.0   # Active = 0
         node_features[i, 1] = def_x # Default X
         node_features[i, 2] = def_y # Default Y
-        # Features 3-10 stay 0.0 for inactive nodes
     
     # --- Build receive count lookup ---
     receive_counts = np.zeros(NUM_NODES)
@@ -85,48 +93,34 @@ def build_graph_from_window(window):
     grouped = passes.groupby('node_idx')
     for node_idx, data in grouped:
         if 0 <= node_idx < NUM_NODES:
-            # [0] Active flag
             node_features[node_idx, 0] = 1.0
-            
-            # [1-2] Average position (normalized)
             node_features[node_idx, 1] = data['x'].mean() / 120.0
             node_features[node_idx, 2] = data['y'].mean() / 80.0
-            
-            # [3] Pass volume
             node_features[node_idx, 3] = len(data) / 20.0
             
-            # [4] Forward progression
             fwd = (data['end_x'] - data['x']).mean()
             node_features[node_idx, 4] = fwd / 120.0
             
-            # [5] Pressure ratio
             if 'pressure_code' in data.columns:
                 node_features[node_idx, 5] = data['pressure_code'].mean()
             
-            # [6] Avg pass length
             if 'pass_length' in data.columns:
                 node_features[node_idx, 6] = data['pass_length'].mean() / 120.0
             
-            # [7] High pass ratio (fraction of aerial passes)
-            # height_code: 0=Ground, 1=Low, 2=High
             if 'height_code' in data.columns:
                 node_features[node_idx, 7] = (data['height_code'] == 2).mean()
             
-            # [8] Progressive pass ratio (passes moving >10m toward goal)
             fwd_distances = data['end_x'] - data['x']
             node_features[node_idx, 8] = (fwd_distances > 10).mean()
             
-            # [9] Receive count (normalized)
             node_features[node_idx, 9] = receive_counts[node_idx] / 20.0
             
-            # [10] Set piece ratio
-            # pattern_code: 0=Regular, 1=SetPiece, 2=Counter
             if 'pattern_code' in data.columns:
                 node_features[node_idx, 10] = (data['pattern_code'] == 1).mean()
 
     x_tensor = torch.tensor(node_features, dtype=torch.float)
 
-    # --- 3. EDGE CONSTRUCTION (Sequential only) [E, 5] ---
+    # --- 3. EDGE CONSTRUCTION [E, 5] ---
     edge_sources = []
     edge_targets = []
     edge_attrs = []
@@ -134,7 +128,6 @@ def build_graph_from_window(window):
     sorted_passes = passes.sort_values('time_min')
     node_indices = sorted_passes['node_idx'].values
     
-    # Extract edge feature arrays
     p_len = sorted_passes['pass_length'].values if 'pass_length' in passes.columns else np.zeros(len(sorted_passes))
     p_ang = sorted_passes['pass_angle'].values if 'pass_angle' in passes.columns else np.zeros(len(sorted_passes))
     p_pres = sorted_passes['pressure_code'].values if 'pressure_code' in passes.columns else np.zeros(len(sorted_passes))
@@ -143,16 +136,14 @@ def build_graph_from_window(window):
     poss_ids = sorted_passes['possession'].values if 'possession' in passes.columns else np.zeros(len(sorted_passes))
     
     def make_edge_attr(idx):
-        """Build 5-dim edge attribute from array index."""
         return [
             p_len[idx] / 120.0,
             p_ang[idx] / 3.14,
             float(p_pres[idx]),
-            float(p_height[idx]) / 2.0,    # 0=Ground, 0.5=Low, 1.0=High
-            float(p_pattern[idx]) / 2.0,    # 0=Regular, 0.5=SetPiece, 1.0=Counter
+            float(p_height[idx]) / 2.0,
+            float(p_pattern[idx]) / 2.0,
         ]
     
-    # SEQUENTIAL EDGES (Temporal flow within possession chains)
     for i in range(len(sorted_passes) - 1):
         src = node_indices[i]
         dst = node_indices[i+1]
@@ -162,7 +153,6 @@ def build_graph_from_window(window):
             edge_targets.append(dst)
             edge_attrs.append(make_edge_attr(i))
             
-    # Handle 0 edges
     if len(edge_sources) == 0:
         edge_index = torch.tensor([[0], [0]], dtype=torch.long)
         edge_attr = torch.tensor([[0, 0, 0, 0, 0]], dtype=torch.float)
@@ -170,49 +160,55 @@ def build_graph_from_window(window):
         edge_index = torch.tensor([edge_sources, edge_targets], dtype=torch.long)
         edge_attr = torch.tensor(edge_attrs, dtype=torch.float)
 
-    # --- 4. GLOBAL CONTEXT (u) [1, 5] ---
+    # --- 4. GLOBAL CONTEXT (u) [1, 3] ---
+    # IMPORTANT: Only opponent-facing features that the graph CANNOT see.
+    # REMOVED: possession_share (leaked Field Tilt / Tempo)
+    # REMOVED: team_territory   (leaked Field Tilt / xT directly)
+    # These were allowing the model to shortcut past the graph structure.
     duration = window['end_time'] - window['start_time']
     
-    # [0] Opponent defensive density
+    # [0] Opponent defensive density (actions per minute)
     opp_density = len(opp_def) / duration if duration > 0 else 0.0
     
-    # [1] Possession share
-    total_passes = window.get('total_passes_in_window', len(passes))
-    possession_share = len(passes) / total_passes if total_passes > 0 else 0.5
-    
-    # [2] Team territory (avg X normalized)
-    team_territory = passes['x'].mean() / 120.0 if not passes.empty else 0.5
-    
-    # [3] Counterpress intensity
+    # [1] Counterpress intensity (opponent counterpresses per minute)
     cp_count = window.get('opp_counterpress_count', 0)
     counterpress_intensity = cp_count / duration if duration > 0 else 0.0
     
-    # [4] Half indicator
+    # [2] Half indicator (0 = 1st half, 1 = 2nd half)
     period = window.get('period', 1)
     half_indicator = 0.0 if period <= 1 else 1.0
     
     u = torch.tensor([[
         opp_density,
-        possession_share,
-        team_territory,
         counterpress_intensity,
         half_indicator
     ]], dtype=torch.float)
 
-    # --- 5. TARGET LABELS (y) ---
-    # [0] Threat Rate: Already [0, 1] (fraction of passes into box)
-    # [1] Press Height: Normalized by pitch length
-    # [2] Field Tilt: Already [0, 1] (ratio, now using x>60 for smoother values)
-    # [3] Verticality: Shifted from [-1, 1] to [0, 1]
+    # --- 5. REGRESSION TARGETS (y) [1, 5] ---
+    # [0] Cumulative xT: log(1 + xT) to compress range, keeps non-zero signal
+    # [1] Press Height: normalized by pitch length
+    # [2] Field Tilt: already [0, 1]
+    # [3] Verticality: shifted from [-1, 1] to [0, 1]
+    # [4] Tempo: passes per minute, normalized by /30 (typical max ~25-30)
     y = torch.tensor([[
-        window['y_threat_rate'],
+        np.log1p(window['y_cum_xt']),             # log(1 + xT)
         window['y_press_height'] / 120.0,
         window['y_field_tilt'],
-        (window['y_verticality'] + 1.0) / 2.0
+        (window['y_verticality'] + 1.0) / 2.0,
+        window['y_tempo'] / 30.0,                  # Normalize tempo
     ]], dtype=torch.float)
+    
+    # --- 6. CLASSIFICATION TARGETS (y_cls) [1, 2] ---
+    # [0] Defensive Posture: 0=LowBlock, 1=MidBlock, 2=HighPress
+    # [1] Offensive Style:   0=Patient, 1=Balanced, 2=Counter
+    y_cls = torch.tensor([[
+        window['y_def_posture'],
+        window['y_off_style'],
+    ]], dtype=torch.long)
 
-    # --- 6. ASSEMBLE ---
+    # --- 7. ASSEMBLE ---
     data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, y=y, u=u)
+    data.y_cls = y_cls
     
     data.match_id = window.get('match_id', 0)
     data.window_id = window['window_id']
@@ -251,6 +247,6 @@ if __name__ == "__main__":
         print(f"Nodes (x): {g.x.shape} (Should be [12, 11])")
         print(f"Edges: {g.edge_index.shape[1]}")
         print(f"Edge attr: {g.edge_attr.shape} (Should be [E, 5])")
-        print(f"Global (u): {g.u.shape} (Should be [1, 5])")
-        print(f"Global values: {g.u.tolist()}")
-        print(f"Targets (y): {g.y.tolist()}")
+        print(f"Global (u): {g.u.shape} (Should be [1, 3])")
+        print(f"Reg targets (y): {g.y.shape} (Should be [1, 5]) -> {g.y.tolist()}")
+        print(f"Cls targets (y_cls): {g.y_cls.shape} (Should be [1, 2]) -> {g.y_cls.tolist()}")

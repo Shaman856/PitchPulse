@@ -18,11 +18,10 @@ class TacticalDataset(InMemoryDataset):
         Args:
             root (str): Folder where the processed .pt file will be saved.
             raw_dir (str): Path to the folder containing raw .pkl files
-            dataset_name (str): Unique name for this collection (e.g. "offline_mix").
+            dataset_name (str): Unique name for this collection (e.g. "offline_mix_v2").
             window_size (int): Size of window in minutes.
             stride (int): Step size in minutes.
-            max_matches (int or None): Limit number of matches to process. 
-                                       None = use all available files.
+            max_matches (int or None): Limit number of matches to process.
         """
         self.raw_event_dir = raw_dir
         self.dataset_name = dataset_name
@@ -40,7 +39,6 @@ class TacticalDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        # Include max_matches in filename so different subsets get different cache files
         match_tag = f"_m{self.max_matches}" if self.max_matches else "_all"
         return [f'tactical_{self.dataset_name}_w{self.window_size}_s{self.stride}{match_tag}.pt']
 
@@ -52,13 +50,11 @@ class TacticalDataset(InMemoryDataset):
         print(f"[Config] Window: {self.window_size}m | Stride: {self.stride}m")
         print(f"[Source] Reading raw events from: {self.raw_event_dir}")
         
-        # 1. Get all .pkl files in the raw folder
         file_paths = sorted(glob.glob(os.path.join(self.raw_event_dir, "*.pkl")))
         
         if len(file_paths) == 0:
             raise FileNotFoundError(f"No .pkl files found in {self.raw_event_dir}. Did you run download_raw.py?")
         
-        # 2. Apply max_matches limit if set
         if self.max_matches and self.max_matches < len(file_paths):
             file_paths = file_paths[:self.max_matches]
             print(f"[Dataset] Limited to {self.max_matches} matches (out of {len(glob.glob(os.path.join(self.raw_event_dir, '*.pkl')))} available)")
@@ -67,7 +63,6 @@ class TacticalDataset(InMemoryDataset):
         
         data_list = []
         
-        # 3. Process Local Files
         for file_path in tqdm(file_paths, desc="Building Graphs"):
             try:
                 match_id_str = os.path.basename(file_path).replace(".pkl", "")
@@ -91,7 +86,6 @@ class TacticalDataset(InMemoryDataset):
             except Exception as e:
                 continue
 
-        # 4. Save to Disk
         print(f"\n[Dataset] Collating {len(data_list)} graphs...")
         
         if self.pre_filter is not None:
@@ -109,7 +103,7 @@ if __name__ == "__main__":
     
     RAW_DIR = "./data/raw_events" 
     ROOT_DIR = "./data_v3"        
-    NAME = "offline_mix"
+    NAME = "offline_mix_v4"       # v4: balanced offensive style + def posture threshold fix
     
     print(f"--- STARTING OFFLINE DATASET BUILD ({NAME}) ---")
     
@@ -119,10 +113,12 @@ if __name__ == "__main__":
         dataset_name=NAME,
         window_size=5, 
         stride=1,
-        max_matches=230  # Set to None for all matches
+        max_matches=230
     )
     
     print(f"\nDataset Ready!")
     print(f"Total Graphs: {len(dataset)}")
-    print(f"Features: {dataset.num_features}")
+    print(f"Node Features: {dataset[0].x.shape}")
+    print(f"Reg Targets (y): {dataset[0].y.shape}")
+    print(f"Cls Targets (y_cls): {dataset[0].y_cls.shape}")
     print(f"Saved at: {dataset.processed_paths[0]}")
