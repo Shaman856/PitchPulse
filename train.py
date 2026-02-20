@@ -1,7 +1,6 @@
 import torch
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
-from torch.utils.data import random_split
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
@@ -9,6 +8,40 @@ from tqdm import tqdm
 # --- IMPORTS ---
 from preprocessing.dataset import TacticalDataset
 from models.model import TacticalGAT
+
+
+def match_level_split(dataset, train_ratio=0.8, seed=42):
+    """
+    Splits dataset by MATCH, not by window.
+    
+    All windows from a given match go to the same set (train or test).
+    This prevents data leakage from overlapping windows (stride < window_size).
+    
+    Returns: (train_indices, test_indices)
+    """
+    # 1. Extract match_id for every graph in the dataset
+    match_ids = []
+    for i in range(len(dataset)):
+        match_ids.append(dataset[i].match_id)
+    
+    # 2. Get unique matches and shuffle
+    unique_matches = sorted(set(match_ids))
+    rng = np.random.RandomState(seed)
+    rng.shuffle(unique_matches)
+    
+    # 3. Split matches
+    n_train = int(len(unique_matches) * train_ratio)
+    train_matches = set(unique_matches[:n_train])
+    test_matches = set(unique_matches[n_train:])
+    
+    # 4. Assign indices
+    train_indices = [i for i, mid in enumerate(match_ids) if mid in train_matches]
+    test_indices = [i for i, mid in enumerate(match_ids) if mid in test_matches]
+    
+    print(f"Match-Level Split: {len(train_matches)} train matches, {len(test_matches)} test matches")
+    print(f"  Train windows: {len(train_indices)} | Test windows: {len(test_indices)}")
+    
+    return train_indices, test_indices
 
 # --- CONFIGURATION ---
 DATASET_PATH = "./data_v3" 
@@ -70,11 +103,10 @@ def train():
         window_size=5, stride=1, max_matches=MAX_MATCHES
     )
     
-    # 2. Split (80% Train, 20% Test)
-    torch.manual_seed(42)
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+    # 2. Split by MATCH (prevents data leakage from overlapping windows)
+    train_indices, test_indices = match_level_split(dataset, train_ratio=0.8, seed=42)
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    test_dataset = torch.utils.data.Subset(dataset, test_indices)
     
     print(f"Train Samples: {len(train_dataset)} | Test Samples: {len(test_dataset)}")
     
