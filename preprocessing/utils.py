@@ -12,11 +12,10 @@ def encode_features(df):
     - 'height_code': 0=Ground, 1=Low, 2=High
     - 'pattern_code': 0=Regular, 1=SetPiece, 2=Counter
     - 'pressure_code': 0=No, 1=Yes
+    - 'body_part_code': 0=Right Foot, 1=Left Foot, 2=Head, 3=Other
     """
     
     # 1. POSITION MAPPING (Detailed -> 12 Tactical Roles)
-    # We map specific StatsBomb names to our 12 fixed graph nodes.
-    # The Graph Builder expects these exact integer IDs (0 to 11).
     pos_map = {
         # 0: Goalkeeper
         'Goalkeeper': 0,
@@ -62,21 +61,26 @@ def encode_features(df):
     def map_pattern(pat):
         if pd.isna(pat): return 0 # Default to Regular
         if 'Regular' in pat: return 0
-        # Group all Set Pieces together
         if any(x in pat for x in ['Throw In', 'Free Kick', 'Corner', 'Goal Kick', 'Kick Off']):
             return 1 
         if 'Counter' in pat: return 2
-        return 0 # Default other obscure types to Regular for simplicity
+        return 0
+
+    # 4. BODY PART MAPPING
+    body_part_map = {
+        'Right Foot': 0,
+        'Left Foot': 1,
+        'Head': 2,
+        'Other': 3,
+        'Drop Kick': 3,    # GK distribution -> Other
+        'Keeper Arm': 3,   # GK throw -> Other
+    }
 
     # --- APPLY MAPPINGS ---
     
     # Position Encoding (Node Feature)
     if 'position' in df.columns:
-        # Map positions using the 12-node map. 
-        # Fallback to 'Center Midfield' (7) if the position is unknown/NaN.
         df['pos_group'] = df['position'].map(pos_map).fillna(7).astype(int)
-        
-        # Create 'node_idx' alias - This is what graph_builder.py looks for
         df['node_idx'] = df['pos_group']
         
     # Pass Height Encoding (Edge Feature)
@@ -90,5 +94,9 @@ def encode_features(df):
     # Pressure Encoding (Edge Weight / Attention)
     if 'under_pressure' in df.columns:
         df['pressure_code'] = df['under_pressure'].fillna(False).astype(int)
+
+    # Body Part Encoding (Edge Feature)
+    if 'pass_body_part' in df.columns:
+        df['body_part_code'] = df['pass_body_part'].map(body_part_map).fillna(0).astype(int)
 
     return df

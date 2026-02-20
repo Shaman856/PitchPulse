@@ -8,7 +8,8 @@ warnings.filterwarnings('ignore')
 def fetch_match_data(match_id,raw_events=None):
     """
     Fetches events and splits them into:
-    1. Passes (Graph Edges) - Includes 'under_pressure', 'play_pattern', 'pass_height'
+    1. Passes (Graph Edges) - Includes 'under_pressure', 'play_pattern', 'pass_height',
+                               'pass_body_part', 'period'
     2. Shots (Threat Targets) - Includes 'shot_statsbomb_xg'
     3. Defense (Intensity Labels) - Includes 'counterpress', 'duel_type'
     """
@@ -33,10 +34,12 @@ def fetch_match_data(match_id,raw_events=None):
     )
     
     # Select columns if they exist
+    # UPDATED: Added 'pass_body_part' and 'period'
     potential_pass_cols = [
         'timestamp', 'minute', 'second', 'player', 'pass_recipient', 
         'location', 'pass_end_location', 'team', 'position',
-        'under_pressure', 'play_pattern', 'pass_height', 'pass_length', 'pass_angle','possession'
+        'under_pressure', 'play_pattern', 'pass_height', 'pass_length', 
+        'pass_angle', 'possession', 'pass_body_part', 'period'
     ]
     cols_pass = [c for c in potential_pass_cols if c in events.columns]
     
@@ -124,7 +127,6 @@ def fetch_match_data(match_id,raw_events=None):
 
 # --- DIAGNOSTIC TEST FUNCTION ---
 if __name__ == "__main__":
-    # Use the 2018 World Cup Final or the user's specific match ID
     TEST_MATCH_ID = 8658  # 2018 World Cup Final (France vs Croatia)
     
     print(f"Running Diagnostic on Match: {TEST_MATCH_ID}")
@@ -135,37 +137,19 @@ if __name__ == "__main__":
         passes = data['passes']
         print(f"\n[1] PASSES: {passes.shape[0]} events")
         print(f"    - Columns: {list(passes.columns)}")
-        if 'play_pattern' in passes.columns:
-            print("    - [OK] 'play_pattern' found.")
-        else:
-            print("    - [FAIL] 'play_pattern' MISSING!")
-            
-        if 'under_pressure' in passes.columns:
-             print(f"    - [OK] 'under_pressure' found. (True Count: {passes['under_pressure'].sum()})")
+        if 'pass_body_part' in passes.columns:
+            print(f"    - [OK] 'pass_body_part' found. Values: {passes['pass_body_part'].value_counts(dropna=False).to_dict()}")
+        if 'period' in passes.columns:
+            print(f"    - [OK] 'period' found. Values: {passes['period'].value_counts().to_dict()}")
 
         # 2. Check SHOTS
         shots = data['shots']
         print(f"\n[2] SHOTS: {shots.shape[0]} events")
         print(f"    - Columns: {list(shots.columns)}")
-        if 'shot_statsbomb_xg' in shots.columns:
-            xg_sum = shots['shot_statsbomb_xg'].sum()
-            print(f"    - [OK] 'shot_statsbomb_xg' found. Total xG in match: {xg_sum:.2f}")
-        else:
-            print("    - [FAIL] 'shot_statsbomb_xg' MISSING! (Critical for xT Prediction)")
 
         # 3. Check DEFENSE
         defense = data['defense']
         print(f"\n[3] DEFENSE: {defense.shape[0]} events")
         print(f"    - Columns: {list(defense.columns)}")
 
-        if 'counterpress' in defense.columns:
-            cp_count = defense['counterpress'].sum()
-            print(f"    - [OK] 'counterpress' found. Count: {cp_count}")
-        else:
-            print("    - [FAIL] 'counterpress' MISSING! (Critical for Intensity Prediction)")
-
         print("\n--- TEST COMPLETE ---")
-        
-        # Optional: Print first row of each to inspect visually
-        # print("\nSample Pass:\n", passes.head(1))
-        # print("\nSample Shot:\n", shots.head(1))

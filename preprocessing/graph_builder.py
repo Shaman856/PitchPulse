@@ -4,135 +4,216 @@ import numpy as np
 from torch_geometric.data import Data
 
 # --- CONFIGURATION ---
-# Fixed 12-Node structure.
-# (Node definitions are handled in utils.py, here we just respect the count)
 NUM_NODES = 12 
 DEFAULT_POSITIONS = {
-    0: [0.05, 0.50], # GK (Goal line, center)
-    1: [0.25, 0.10], # LB (Defensive third, left)
-    2: [0.20, 0.35], # CB_L (Defensive third, left-center)
-    3: [0.20, 0.65], # CB_R (Defensive third, right-center)
-    4: [0.25, 0.90], # RB (Defensive third, right)
-    5: [0.40, 0.50], # DM (Midfield circle, deep)
-    6: [0.55, 0.30], # CM_L (Midfield, left)
-    7: [0.55, 0.70], # CM_R (Midfield, right)
-    8: [0.70, 0.50], # AM (Attacking third, center)
-    9: [0.75, 0.15], # LW (Attacking third, wide left)
-    10:[0.75, 0.85], # RW (Attacking third, wide right)
-    11:[0.85, 0.50]  # ST (Opponent box, center)
+    0: [0.05, 0.50], # GK
+    1: [0.25, 0.10], # LB
+    2: [0.20, 0.35], # CB_L
+    3: [0.20, 0.65], # CB_R
+    4: [0.25, 0.90], # RB
+    5: [0.40, 0.50], # DM
+    6: [0.55, 0.30], # CM_L
+    7: [0.55, 0.70], # CM_R
+    8: [0.70, 0.50], # AM
+    9: [0.75, 0.15], # LW
+    10:[0.75, 0.85], # RW
+    11:[0.85, 0.50]  # ST
 }
 
 def build_graph_from_window(window):
     """
-    Converts a Window Bundle (Passes + Labels) into a PyTorch Geometric Data object.
+    Converts a Window Bundle into a PyTorch Geometric Data object.
     
-    Features:
-    1. Fixed 12-Node Topology (GK to Striker).
-    2. Sequence-based Edges (Pass i -> Pass i+1).
-    3. Ghost Pass Fix (Checks Possession ID chain).
-    4. Context-Aware (Global Opponent Density).
+    Node Features (11-dim):
+    [0]  Active flag           - 1.0 if the role touched the ball
+    [1]  Avg X position        - Normalized mean X (0-1)
+    [2]  Avg Y position        - Normalized mean Y (0-1)
+    [3]  Pass volume           - Passes made by this role (normalized)
+    [4]  Forward progression   - Avg forward distance per pass
+    [5]  Pressure ratio        - Fraction of passes under pressure
+    [6]  Avg pass length       - Mean pass distance (normalized)
+    [7]  High pass ratio       - Fraction of passes that are aerial (from height_code)
+    [8]  Progressive pass ratio- Fraction of passes moving >10m forward
+    [9]  Receive count         - Passes RECEIVED by this role (normalized)
+    [10] Set piece ratio       - Fraction of passes from set piece situations
+    
+    Edge Features (5-dim):
+    [0] Pass length    (normalized)
+    [1] Pass angle     (normalized)
+    [2] Pressure       (binary)
+    [3] Height code    (normalized: 0=Ground, 0.5=Low, 1.0=High)
+    [4] Pattern code   (normalized: 0=Regular, 0.5=SetPiece, 1.0=Counter)
+    
+    Global Context (5-dim):
+    [0] Opponent defensive density  (actions per minute)
+    [1] Possession share            (team passes / all passes in window)
+    [2] Team territory              (avg X of team passes, normalized)
+    [3] Counterpress intensity      (opponent counterpresses / window duration)
+    [4] Half indicator              (0 = 1st half, 1 = 2nd half)
     """
     
     # 1. Unpack the Bundle
     passes = window['passes'].copy()
     opp_def = window['opp_defense']
     
-    # --- 2. NODE FEATURES (x) ---
-    # Shape: [12, 3] -> [Active?, Avg_X, Avg_Y]
-    # We rely on 'node_idx' created by utils.encode_features
+    # --- 2. NODE FEATURES (x) [12, 11] ---
     if 'node_idx' not in passes.columns:
-        raise ValueError("Critical: 'node_idx' missing. Please run utils.encode_features() before slicing.")
+        raise ValueError("Critical: 'node_idx' missing. Run utils.encode_features() before slicing.")
 
-    node_features = np.zeros((NUM_NODES, 3)) 
+    node_features = np.zeros((NUM_NODES, 11)) 
 
-    # 1. Pre-fill with Defaults (The "Ghost" Structure)
-    # This ensures that if a player is silent, they stay in position visually
+    # Pre-fill defaults
     for i in range(NUM_NODES):
         def_x, def_y = DEFAULT_POSITIONS[i]
-        node_features[i, 0] = 0.0   # Active = 0 (Silent)
+        node_features[i, 0] = 0.0   # Active = 0
         node_features[i, 1] = def_x # Default X
         node_features[i, 2] = def_y # Default Y
+        # Features 3-10 stay 0.0 for inactive nodes
+    
+    # --- Build receive count lookup ---
+    receive_counts = np.zeros(NUM_NODES)
+    if 'pass_recipient' in passes.columns:
+        player_role_map = passes.groupby('player')['node_idx'].first().to_dict()
+        for _, row in passes.iterrows():
+            recipient = row.get('pass_recipient', None)
+            if pd.notna(recipient) and recipient in player_role_map:
+                recv_idx = int(player_role_map[recipient])
+                if 0 <= recv_idx < NUM_NODES:
+                    receive_counts[recv_idx] += 1
     
     # Aggregate stats per Tactical Role
     grouped = passes.groupby('node_idx')
     for node_idx, data in grouped:
         if 0 <= node_idx < NUM_NODES:
-            node_features[node_idx, 0] = 1.0 # Feature 0: Active in this window
-            node_features[node_idx, 1] = data['x'].mean() / 120.0 # Feature 1: Normalized X
-            node_features[node_idx, 2] = data['y'].mean() / 80.0  # Feature 2: Normalized Y
+            # [0] Active flag
+            node_features[node_idx, 0] = 1.0
+            
+            # [1-2] Average position (normalized)
+            node_features[node_idx, 1] = data['x'].mean() / 120.0
+            node_features[node_idx, 2] = data['y'].mean() / 80.0
+            
+            # [3] Pass volume
+            node_features[node_idx, 3] = len(data) / 20.0
+            
+            # [4] Forward progression
+            fwd = (data['end_x'] - data['x']).mean()
+            node_features[node_idx, 4] = fwd / 120.0
+            
+            # [5] Pressure ratio
+            if 'pressure_code' in data.columns:
+                node_features[node_idx, 5] = data['pressure_code'].mean()
+            
+            # [6] Avg pass length
+            if 'pass_length' in data.columns:
+                node_features[node_idx, 6] = data['pass_length'].mean() / 120.0
+            
+            # [7] High pass ratio (fraction of aerial passes)
+            # height_code: 0=Ground, 1=Low, 2=High
+            if 'height_code' in data.columns:
+                node_features[node_idx, 7] = (data['height_code'] == 2).mean()
+            
+            # [8] Progressive pass ratio (passes moving >10m toward goal)
+            fwd_distances = data['end_x'] - data['x']
+            node_features[node_idx, 8] = (fwd_distances > 10).mean()
+            
+            # [9] Receive count (normalized)
+            node_features[node_idx, 9] = receive_counts[node_idx] / 20.0
+            
+            # [10] Set piece ratio
+            # pattern_code: 0=Regular, 1=SetPiece, 2=Counter
+            if 'pattern_code' in data.columns:
+                node_features[node_idx, 10] = (data['pattern_code'] == 1).mean()
 
     x_tensor = torch.tensor(node_features, dtype=torch.float)
 
-    # --- 3. EDGE CONSTRUCTION (Sequence & Flow) ---
-    # Logic: Connect Pass(i) -> Pass(i+1) if they belong to the same possession chain.
-    
+    # --- 3. EDGE CONSTRUCTION (Sequential only) [E, 5] ---
     edge_sources = []
     edge_targets = []
     edge_attrs = []
     
-    # Sort chronologically to establish flow
     sorted_passes = passes.sort_values('time_min')
     node_indices = sorted_passes['node_idx'].values
     
-    # Extract Edge Features (Safe Access with defaults)
-    p_len = sorted_passes['pass_length'].values if 'pass_length' in passes else np.zeros(len(passes))
-    p_ang = sorted_passes['pass_angle'].values if 'pass_angle' in passes else np.zeros(len(passes))
-    p_pres = sorted_passes['pressure_code'].values if 'pressure_code' in passes else np.zeros(len(passes))
+    # Extract edge feature arrays
+    p_len = sorted_passes['pass_length'].values if 'pass_length' in passes.columns else np.zeros(len(sorted_passes))
+    p_ang = sorted_passes['pass_angle'].values if 'pass_angle' in passes.columns else np.zeros(len(sorted_passes))
+    p_pres = sorted_passes['pressure_code'].values if 'pressure_code' in passes.columns else np.zeros(len(sorted_passes))
+    p_height = sorted_passes['height_code'].values if 'height_code' in passes.columns else np.zeros(len(sorted_passes))
+    p_pattern = sorted_passes['pattern_code'].values if 'pattern_code' in passes.columns else np.zeros(len(sorted_passes))
+    poss_ids = sorted_passes['possession'].values if 'possession' in passes.columns else np.zeros(len(sorted_passes))
     
-    # Extract Possession ID (Critical for Ghost Pass Fix)
-    # If missing (user didn't update pipeline), default to 0s (Logic degrades gracefully but loses fix)
-    poss_ids = sorted_passes['possession'].values if 'possession' in passes else np.zeros(len(passes))
+    def make_edge_attr(idx):
+        """Build 5-dim edge attribute from array index."""
+        return [
+            p_len[idx] / 120.0,
+            p_ang[idx] / 3.14,
+            float(p_pres[idx]),
+            float(p_height[idx]) / 2.0,    # 0=Ground, 0.5=Low, 1.0=High
+            float(p_pattern[idx]) / 2.0,    # 0=Regular, 0.5=SetPiece, 1.0=Counter
+        ]
     
+    # SEQUENTIAL EDGES (Temporal flow within possession chains)
     for i in range(len(sorted_passes) - 1):
         src = node_indices[i]
         dst = node_indices[i+1]
         
-        # EDGE VALIDATION LOGIC:
-        # 1. Source and Target must be valid 0-11 Roles (No unknown/subs)
-        # 2. Must be part of the SAME possession chain (Fixes "Teleporting" edges)
         if (src < NUM_NODES and dst < NUM_NODES) and (poss_ids[i] == poss_ids[i+1]):
-            
             edge_sources.append(src)
             edge_targets.append(dst)
+            edge_attrs.append(make_edge_attr(i))
             
-            # Edge Attributes: [Normalized Length, Normalized Angle, Pressure Binary]
-            attr = [
-                p_len[i] / 120.0,  
-                p_ang[i] / 3.14,   
-                float(p_pres[i])   
-            ]
-            edge_attrs.append(attr)
-            
-    # Handle rare case of 0 edges (e.g., 1 pass in whole window)
+    # Handle 0 edges
     if len(edge_sources) == 0:
         edge_index = torch.tensor([[0], [0]], dtype=torch.long)
-        edge_attr = torch.tensor([[0, 0, 0]], dtype=torch.float)
+        edge_attr = torch.tensor([[0, 0, 0, 0, 0]], dtype=torch.float)
     else:
         edge_index = torch.tensor([edge_sources, edge_targets], dtype=torch.long)
         edge_attr = torch.tensor(edge_attrs, dtype=torch.float)
 
-    # --- 4. GLOBAL CONTEXT (u) ---
-    # Feature: Opponent Defensive Density (Actions per Minute)
+    # --- 4. GLOBAL CONTEXT (u) [1, 5] ---
     duration = window['end_time'] - window['start_time']
-    # Avoid division by zero
+    
+    # [0] Opponent defensive density
     opp_density = len(opp_def) / duration if duration > 0 else 0.0
     
-    # Global feature vector [1, 1]
-    u = torch.tensor([[opp_density]], dtype=torch.float)
-
-    # --- 5. TARGET LABELS (y) ---
-    # The Tactical Suite: [xG, PressHeight, Tilt, Verticality]
-    y = torch.tensor([[
-        window['y_xg'], 
-        window['y_press_height'] / 120.0, # Normalize coordinate
-        window['y_field_tilt'],
-        window['y_verticality']
+    # [1] Possession share
+    total_passes = window.get('total_passes_in_window', len(passes))
+    possession_share = len(passes) / total_passes if total_passes > 0 else 0.5
+    
+    # [2] Team territory (avg X normalized)
+    team_territory = passes['x'].mean() / 120.0 if not passes.empty else 0.5
+    
+    # [3] Counterpress intensity
+    cp_count = window.get('opp_counterpress_count', 0)
+    counterpress_intensity = cp_count / duration if duration > 0 else 0.0
+    
+    # [4] Half indicator
+    period = window.get('period', 1)
+    half_indicator = 0.0 if period <= 1 else 1.0
+    
+    u = torch.tensor([[
+        opp_density,
+        possession_share,
+        team_territory,
+        counterpress_intensity,
+        half_indicator
     ]], dtype=torch.float)
 
-    # --- 6. ASSEMBLE OBJECT ---
+    # --- 5. TARGET LABELS (y) ---
+    # [0] Threat Rate: Already [0, 1] (fraction of passes into box)
+    # [1] Press Height: Normalized by pitch length
+    # [2] Field Tilt: Already [0, 1] (ratio, now using x>60 for smoother values)
+    # [3] Verticality: Shifted from [-1, 1] to [0, 1]
+    y = torch.tensor([[
+        window['y_threat_rate'],
+        window['y_press_height'] / 120.0,
+        window['y_field_tilt'],
+        (window['y_verticality'] + 1.0) / 2.0
+    ]], dtype=torch.float)
+
+    # --- 6. ASSEMBLE ---
     data = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_attr, y=y, u=u)
     
-    # Attach Metadata (Useful for debugging/splitting later)
     data.match_id = window.get('match_id', 0)
     data.window_id = window['window_id']
     data.team_name = window['team_name']
@@ -143,13 +224,12 @@ def build_graph_from_window(window):
 if __name__ == "__main__":
     from window_slicer import get_rolling_windows
     from data_pipeline import fetch_match_data
-    from .utils import encode_features
+    from utils import encode_features
     
-    match_id = 8658 # World Cup Final
+    match_id = 8658
     print(f"1. Fetching Match {match_id}...")
     raw = fetch_match_data(match_id)
     
-    # CRITICAL: Encode features BEFORE slicing so 'node_idx' exists
     if not raw['passes'].empty:
         raw['passes'] = encode_features(raw['passes'])
     
@@ -166,9 +246,11 @@ if __name__ == "__main__":
     
     if len(graphs) > 10:
         g = graphs[10]
-        print("\n--- Graph Inspection (Window 10) ---")
+        print(f"\n--- Graph Inspection (Window 10) ---")
         print(f"Team: {g.team_name} | Match: {g.match_id}")
-        print(f"Nodes (x): {g.x.shape} (Should be [12, 3])")
-        print(f"Edges: {g.edge_index.shape[1]} (Possession Chains)")
-        print(f"Global (u): {g.u.item():.4f} (Opponent Density)")
-        print(f"Targets (y): {g.y.tolist()} \n(xG, Press, Tilt, Vert)")
+        print(f"Nodes (x): {g.x.shape} (Should be [12, 11])")
+        print(f"Edges: {g.edge_index.shape[1]}")
+        print(f"Edge attr: {g.edge_attr.shape} (Should be [E, 5])")
+        print(f"Global (u): {g.u.shape} (Should be [1, 5])")
+        print(f"Global values: {g.u.tolist()}")
+        print(f"Targets (y): {g.y.tolist()}")

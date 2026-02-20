@@ -15,16 +15,19 @@ DATASET_NAME = "offline_mix"
 RAW_DATA_DIR = "./data/raw_events"
 BATCH_SIZE = 32
 LEARNING_RATE = 0.001
-EPOCHS = 30
+EPOCHS = 60
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-GRADIENT_CLIP = 1.0 # NEW: Prevents exploding gradients from the 20x xG weight
+GRADIENT_CLIP = 1.0 # Prevents exploding gradients
 
 # --- WEIGHTED LOSS CONFIGURATION ---
-# Index 0: xG (Weight 20.0) - The most critical metric
+# All targets now on [0, 1] scale with reasonable distributions.
+# Threat Rate replaces xG — it's continuous and well-distributed,
+# so it no longer needs heavy upweighting.
+# Index 0: Threat Rate (Weight 2.0)
 # Index 1: Press Height (Weight 1.0)
-# Index 2: Field Tilt (Weight 1.0)
+# Index 2: Field Tilt (Weight 1.5) - Slightly upweighted since hardest metric
 # Index 3: Verticality (Weight 1.5)
-LOSS_WEIGHTS = torch.tensor([20.0, 1.0, 1.0, 1.5]).to(DEVICE)
+LOSS_WEIGHTS = torch.tensor([2.0, 1.0, 1.5, 1.5]).to(DEVICE)
 
 def weighted_mse_loss(input, target, weights):
     """
@@ -39,7 +42,6 @@ def train():
     
     # 1. Load Data
     print("Loading Dataset...")
-    # NOTE: Ensure window_size/stride match what you generated in dataset.py
     dataset = TacticalDataset(root=DATASET_PATH, raw_dir=RAW_DATA_DIR, dataset_name=DATASET_NAME, window_size=5, stride=1)
     
     # 2. Split (80% Train, 20% Test)
@@ -55,8 +57,25 @@ def train():
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     
     # 4. Initialize Model
-    model = TacticalGAT(num_node_features=3, num_classes=4).to(DEVICE)
+    # AUTO-DETECT all dimensions from the dataset
+    sample = dataset[0]
+    num_node_features = sample.x.shape[1]
+    edge_dim = sample.edge_attr.shape[1]
+    global_dim = sample.u.shape[1]
+    
+    print(f"Detected: {num_node_features} node features, {edge_dim} edge features, {global_dim} global features")
+    
+    model = TacticalGAT(
+        num_node_features=num_node_features, 
+        num_classes=4, 
+        edge_dim=edge_dim,
+        global_dim=global_dim
+    ).to(DEVICE)
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    
+    # Learning rate scheduler — cosine decay lets the model fine-tune in later epochs
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     
     # Metrics Tracking
     train_losses = []
@@ -76,8 +95,7 @@ def train():
             # Forward
             out = model(batch)
             
-            # FIX 1: Robust Reshaping
-            # Ensure target is exactly [Batch_Size, 4] regardless of input oddities
+            # Robust Reshaping
             target = batch.y.view(-1, 4)
             
             # Calculate Loss
@@ -87,8 +105,7 @@ def train():
             optimizer.zero_grad()
             loss.backward()
             
-            # FIX 2: Gradient Clipping
-            # Prevents the "Exploding Gradient" from the high xG weight
+            # Gradient Clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRADIENT_CLIP)
             
             optimizer.step()
@@ -107,7 +124,6 @@ def train():
                 batch = batch.to(DEVICE)
                 out = model(batch)
                 
-                # Apply same Shape Safety in validation
                 target = batch.y.view(-1, 4)
                 
                 loss = weighted_mse_loss(out, target, LOSS_WEIGHTS)
@@ -116,7 +132,10 @@ def train():
         avg_val_loss = total_val_loss / len(test_loader)
         val_losses.append(avg_val_loss)
         
-        print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+        
+        # Step the scheduler
+        scheduler.step()
         
         # Save Best Model
         if avg_val_loss < best_val_loss:
@@ -129,7 +148,7 @@ def train():
     plt.figure(figsize=(10, 5))
     plt.plot(train_losses, label='Training Loss')
     plt.plot(val_losses, label='Validation Loss')
-    plt.title(f'Tactical GAT Training (Weighted xG={LOSS_WEIGHTS[0].item()})')
+    plt.title(f'Tactical GAT Training (Threat={LOSS_WEIGHTS[0].item()}, Tilt={LOSS_WEIGHTS[2].item()})')
     plt.xlabel('Epochs')
     plt.ylabel('Weighted MSE Loss')
     plt.legend()
