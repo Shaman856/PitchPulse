@@ -21,4 +21,5 @@ data_v3/
 training_curve.png
 inference_analysis.png
 # Or un-comment the line below to ignore ALL pngs if you don't have static assets
-# *.png
+*.png
+*.sh
