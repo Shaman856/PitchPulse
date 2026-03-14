@@ -2,20 +2,11 @@ import pandas as pd
 import numpy as np
 import warnings
 
-# Suppress warnings
 warnings.filterwarnings('ignore')
 
 # =============================================================================
 # EXPECTED THREAT (xT) LOOKUP GRID
 # =============================================================================
-# Published xT values on a 12x8 grid (pitch divided into 12 columns x 8 rows).
-# Source: Karun Singh's xT model (widely used in football analytics).
-# Each cell represents the probability that a possession in that zone
-# will eventually lead to a goal. Values increase toward the opponent's goal.
-# Columns: 0 (own goal line) -> 11 (opponent goal line)
-# Rows: 0 (left touchline) -> 7 (right touchline)
-# =============================================================================
-
 XT_GRID = np.array([
     [0.0030, 0.0036, 0.0042, 0.0045, 0.0048, 0.0052, 0.0064, 0.0082, 0.0117, 0.0191, 0.0370, 0.0790],
     [0.0023, 0.0030, 0.0036, 0.0041, 0.0046, 0.0053, 0.0070, 0.0098, 0.0153, 0.0268, 0.0530, 0.1060],
@@ -28,24 +19,15 @@ XT_GRID = np.array([
 ])
 
 def _get_xt_value(x, y):
-    """
-    Look up the xT value for a given (x, y) coordinate on the StatsBomb pitch.
-    StatsBomb pitch: x in [0, 120], y in [0, 80].
-    Grid: 12 columns (x-axis), 8 rows (y-axis).
-    """
-    col = int(np.clip(x / 10.0, 0, 11))    # 120 / 12 = 10m per column
-    row = int(np.clip(y / 10.0, 0, 7))      # 80 / 8 = 10m per row
+    """Look up the xT value for a given (x, y) on the StatsBomb pitch."""
+    col = int(np.clip(x / 10.0, 0, 11))
+    row = int(np.clip(y / 10.0, 0, 7))
     return XT_GRID[row, col]
 
 def compute_cumulative_xt(passes_df):
-    """
-    Computes cumulative xT gained from all passes.
-    xT_gained = xT(end_zone) - xT(start_zone), only counted if positive.
-    This gives every window a continuous, non-zero value.
-    """
+    """Computes cumulative xT gained from all passes (positive gains only)."""
     if passes_df.empty:
         return 0.0
-    
     xt_gained = 0.0
     for _, row in passes_df.iterrows():
         start_xt = _get_xt_value(row['x'], row['y'])
@@ -53,37 +35,117 @@ def compute_cumulative_xt(passes_df):
         delta = end_xt - start_xt
         if delta > 0:
             xt_gained += delta
-    
     return xt_gained
 
 
-def calculate_window_metrics(passes, shots, defense, team_name, window_duration):
+def compute_cumulative_xt_all_actions(passes_df, carries_df):
+    """
+    TIER 1 CHANGE: Computes cumulative xT from passes AND carries.
+    Carries move the ball into higher-threat zones and should count
+    toward total threat generated.
+    """
+    xt_from_passes = compute_cumulative_xt(passes_df)
+    
+    xt_from_carries = 0.0
+    if not carries_df.empty:
+        for _, row in carries_df.iterrows():
+            if pd.notna(row.get('x')) and pd.notna(row.get('end_x')):
+                start_xt = _get_xt_value(row['x'], row['y'])
+                end_xt = _get_xt_value(row['end_x'], row['end_y'])
+                delta = end_xt - start_xt
+                if delta > 0:
+                    xt_from_carries += delta
+    
+    return xt_from_passes + xt_from_carries
+
+
+def compute_running_score(shots_df, team_name, window_start):
+    """
+    Computes the score differential at the start of a window.
+    Returns: (team_goals - opponent_goals) as of window_start time.
+    """
+    if shots_df.empty:
+        return 0
+    
+    goals_before = shots_df[
+        (shots_df['is_goal'] == True) & 
+        (shots_df['time_min'] < window_start)
+    ]
+    
+    if goals_before.empty:
+        return 0
+    
+    team_goals = (goals_before['team'] == team_name).sum()
+    opp_goals = (goals_before['team'] != team_name).sum()
+    
+    return int(team_goals - opp_goals)
+
+
+def compute_match_outcome(shots_df, team_name):
+    """
+    SUITE NEW: Computes the final match outcome for a team.
+    
+    Returns:
+        0 = Loss
+        1 = Draw  
+        2 = Win
+    
+    Used as a classification target for the Outcome Probability head.
+    Every window in a match gets the SAME outcome label — the model
+    learns which tactical states are associated with winning/losing.
+    """
+    if shots_df.empty:
+        return 1  # Default to draw if no shot data
+    
+    all_goals = shots_df[shots_df['is_goal'] == True]
+    
+    team_goals = (all_goals['team'] == team_name).sum()
+    opp_goals = (all_goals['team'] != team_name).sum()
+    
+    if team_goals > opp_goals:
+        return 2  # Win
+    elif team_goals < opp_goals:
+        return 0  # Loss
+    else:
+        return 1  # Draw
+
+
+def calculate_window_metrics(passes, shots, defense, carries, team_name, window_duration):
     """
     Computes all tactical metrics for a single team in a single window.
     
+    TIER 1 CHANGE: Now includes carries in xT computation.
+    
     Returns 5 regression targets + 1 classification target (defensive posture).
-    Offensive style classification is deferred to a second pass (see get_rolling_windows).
     """
-    # 1. Split Data into Team vs Opponent
+    # Split into team vs opponent
     t_passes = passes[passes['team'] == team_name]
     opp_passes = passes[passes['team'] != team_name]
+    t_carries = carries[carries['team'] == team_name] if not carries.empty else pd.DataFrame()
     
     t_shots = shots[shots['team'] == team_name]
-    
     opp_def = defense[defense['team'] != team_name]
     
-    # --- METRIC 1: CUMULATIVE xT (Offensive Threat) ---
-    cum_xt = compute_cumulative_xt(t_passes)
+    # --- METRIC 1: CUMULATIVE xT (Now includes carries) ---
+    cum_xt = compute_cumulative_xt_all_actions(t_passes, t_carries)
     
-    # --- METRIC 2: DEFENSIVE INTENSITY (Opponent Press Height) ---
-    if not opp_def.empty:
+    # --- METRIC 2: PRESS HEIGHT ---
+    if not opp_def.empty and 'x' in opp_def.columns:
         avg_press_height = opp_def['x'].mean()
     else:
         avg_press_height = 50.0 
         
-    # --- METRIC 3: TERRITORIAL DOMINANCE (Field Tilt) ---
+    # --- METRIC 3: FIELD TILT ---
     t_opp_half = t_passes[t_passes['x'] > 60].shape[0]
     opp_opp_half = opp_passes[opp_passes['x'] > 60].shape[0]
+    
+    # Also count carries in opponent half for territorial dominance
+    if not t_carries.empty:
+        t_opp_half += t_carries[t_carries['x'] > 60].shape[0]
+    opp_carries = carries[carries['team'] != team_name] if not carries.empty else pd.DataFrame()
+    if not opp_carries.empty:
+        opp_opp_half += opp_carries[opp_carries['x'] > 60].shape[0]
+    
     total_opp_half = t_opp_half + opp_opp_half
     field_tilt = t_opp_half / total_opp_half if total_opp_half > 0 else 0.5
         
@@ -93,7 +155,6 @@ def calculate_window_metrics(passes, shots, defense, team_name, window_duration)
             dist = t_passes['pass_length'].sum()
         else:
             dist = np.sqrt((t_passes['end_x']-t_passes['x'])**2 + (t_passes['end_y']-t_passes['y'])**2).sum()
-            
         forward_dist = (t_passes['end_x'] - t_passes['x']).sum()
         verticality = forward_dist / dist if dist > 0 else 0.0
     else:
@@ -104,8 +165,6 @@ def calculate_window_metrics(passes, shots, defense, team_name, window_duration)
     tempo = team_pass_count / window_duration if window_duration > 0 else 0.0
     
     # --- CLASSIFICATION 1: DEFENSIVE POSTURE ---
-    # Adjusted: Lowered High Press boundary from 70 -> 65 to improve 
-    # class balance (more High Press samples for the model to learn from).
     if avg_press_height > 65:
         def_posture = 2  # High Press
     elif avg_press_height > 50:
@@ -127,31 +186,15 @@ def calculate_window_metrics(passes, shots, defense, team_name, window_duration)
 
 def assign_offensive_style_labels(windows):
     """
-    TWO-PASS CLASSIFICATION: Assigns offensive style labels based on the
-    actual data distribution using percentile-based thresholds.
-    
-    This guarantees roughly balanced classes (~33% each) regardless of
-    what the raw verticality/tempo distributions look like.
-    
-    Steps:
-      1. Normalize verticality and tempo to [0, 1] across all windows
-      2. Compute composite 'directness' = 0.5 * norm_vert + 0.5 * norm_tempo
-      3. Find 33rd and 67th percentile of this score
-      4. Classify: bottom third = Patient, middle = Balanced, top = Counter
-    
-    Labels:
-      0 = Patient Build-Up  (slow, lateral/backward passing)
-      1 = Balanced           (moderate directness and tempo)
-      2 = Counter / Direct   (fast, forward passing)
+    TWO-PASS CLASSIFICATION: Assigns offensive style labels using
+    percentile-based thresholds for balanced classes.
     """
     if not windows:
         return windows
     
-    # 1. Extract raw values
     verticalities = np.array([w['y_verticality'] for w in windows])
     tempos = np.array([w['y_tempo'] for w in windows])
     
-    # 2. Normalize each to [0, 1] range across all windows
     vert_min, vert_max = verticalities.min(), verticalities.max()
     tempo_min, tempo_max = tempos.min(), tempos.max()
     
@@ -161,14 +204,11 @@ def assign_offensive_style_labels(windows):
     norm_vert = (verticalities - vert_min) / vert_range
     norm_tempo = (tempos - tempo_min) / tempo_range
     
-    # 3. Composite directness score (equal weight to both dimensions)
     directness = 0.5 * norm_vert + 0.5 * norm_tempo
     
-    # 4. Percentile-based thresholds (terciles → ~33% each class)
     p33 = np.percentile(directness, 33.33)
     p67 = np.percentile(directness, 66.67)
     
-    # 5. Assign labels
     for i, w in enumerate(windows):
         if directness[i] <= p33:
             w['y_off_style'] = 0   # Patient Build-Up
@@ -182,39 +222,47 @@ def assign_offensive_style_labels(windows):
 
 def get_rolling_windows(data_dict, match_id, window_size=5, stride=1):
     """
-    Slices match into overlapping windows and computes tactical labels 
-    for each team separately.
+    Slices match into overlapping windows and computes tactical labels.
     
-    TWO-PASS APPROACH:
-      Pass 1: Compute all regression metrics and defensive posture labels.
-      Pass 2: Derive offensive style labels from the full distribution
-              using percentile-based thresholds (guarantees balanced classes).
-    
-    Each window bundle contains:
-      - 5 regression targets (cum_xt, press_height, field_tilt, verticality, tempo)
-      - 2 classification targets (def_posture, off_style)
+    TIER 1 CHANGES:
+    - Now slices carries and dribbles into each window
+    - Computes running score differential at each window start
+    - Computes match progress (0→1) for each window
+    - Passes carries/dribbles through to graph_builder via window bundle
     """
     passes_df = data_dict['passes']
     shots_df = data_dict['shots']
     defense_df = data_dict['defense']
+    carries_df = data_dict.get('carries', pd.DataFrame())
+    dribbles_df = data_dict.get('dribbles', pd.DataFrame())
     
     windows = []
     
-    # 1. Determine Match Duration
+    # Match duration
+    all_times = []
     if not passes_df.empty:
-        match_duration = passes_df['time_min'].max()
-    else:
-        match_duration = 90.0
+        all_times.append(passes_df['time_min'].max())
+    if not defense_df.empty and 'time_min' in defense_df.columns:
+        all_times.append(defense_df['time_min'].max())
+    if not carries_df.empty and 'time_min' in carries_df.columns:
+        all_times.append(carries_df['time_min'].max())
     
-    # 2. Identify Teams
+    match_duration = max(all_times) if all_times else 90.0
+    
+    # Teams
     teams = passes_df['team'].unique()
     if len(teams) < 2:
         print("Warning: Less than 2 teams found. Skipping.")
         return []
-    
-    team_list = sorted(teams) 
+    team_list = sorted(teams)
     
     print(f"Processing Match Duration: {match_duration:.1f} min")
+    
+    # SUITE NEW: Compute match outcome for each team (same for all windows in match)
+    team_outcomes = {}
+    for team in team_list:
+        team_outcomes[team] = compute_match_outcome(shots_df, team)
+    print(f"Match Outcomes: {team_outcomes}")
     
     start_time = 0
     window_id = 0
@@ -225,41 +273,60 @@ def get_rolling_windows(data_dict, match_id, window_size=5, stride=1):
     while start_time < match_duration:
         end_time = start_time + window_size
         
-        # --- Slice Data (Temporal Slice) ---
+        # --- Temporal Slice ---
         pass_win = passes_df[(passes_df['time_min'] >= start_time) & (passes_df['time_min'] < end_time)]
         shot_win = shots_df[(shots_df['time_min'] >= start_time) & (shots_df['time_min'] < end_time)]
-        def_win = defense_df[(defense_df['time_min'] >= start_time) & (defense_df['time_min'] < end_time)]
+        def_win = defense_df[(defense_df['time_min'] >= start_time) & (defense_df['time_min'] < end_time)] if not defense_df.empty else pd.DataFrame()
+        
+        # NEW: Slice carries and dribbles
+        carry_win = pd.DataFrame()
+        if not carries_df.empty and 'time_min' in carries_df.columns:
+            carry_win = carries_df[(carries_df['time_min'] >= start_time) & (carries_df['time_min'] < end_time)]
+        
+        dribble_win = pd.DataFrame()
+        if not dribbles_df.empty and 'time_min' in dribbles_df.columns:
+            dribble_win = dribbles_df[(dribbles_df['time_min'] >= start_time) & (dribbles_df['time_min'] < end_time)]
         
         if not pass_win.empty:
             
-            # --- GLOBAL STATS ---
             total_passes_in_window = len(pass_win)
             duration = window_size
             
-            # Counterpress count from opponent defense
+            # Counterpress count
             opp_counterpress = {}
             for team in team_list:
-                opp_def_win = def_win[def_win['team'] != team]
+                opp_def_win = def_win[def_win['team'] != team] if not def_win.empty else pd.DataFrame()
                 if 'counterpress' in opp_def_win.columns:
                     opp_counterpress[team] = opp_def_win['counterpress'].sum()
                 else:
                     opp_counterpress[team] = 0
             
-            # Determine period
+            # Period
             window_midpoint = (start_time + end_time) / 2.0
             if 'period' in pass_win.columns:
                 period = pass_win['period'].mode().iloc[0] if not pass_win['period'].mode().empty else 1
             else:
                 period = 1 if window_midpoint < 45 else 2
             
+            # NEW: Match progress (0 → 1)
+            match_progress = min(window_midpoint / match_duration, 1.0) if match_duration > 0 else 0.5
+            
             for team in team_list:
                 
                 metrics = calculate_window_metrics(
-                    pass_win, shot_win, def_win, team, duration
+                    pass_win, shot_win, def_win, carry_win, team, duration
                 )
                 
                 team_passes = pass_win[pass_win['team'] == team].copy()
                 team_shots = shot_win[shot_win['team'] == team].copy()
+                team_carries = carry_win[carry_win['team'] == team].copy() if not carry_win.empty else pd.DataFrame()
+                team_dribbles = dribble_win[dribble_win['team'] == team].copy() if not dribble_win.empty else pd.DataFrame()
+                
+                # NEW: Team's defensive actions in this window
+                team_defense = def_win[def_win['team'] == team].copy() if not def_win.empty else pd.DataFrame()
+                
+                # NEW: Running score at window start
+                score_diff = compute_running_score(shots_df, team, start_time)
                 
                 if not team_passes.empty:
                     window_bundle = {
@@ -274,10 +341,20 @@ def get_rolling_windows(data_dict, match_id, window_size=5, stride=1):
                         'shots': team_shots,
                         'opp_defense': metrics['_opp_def'],
                         
-                        # Global context data for graph_builder
+                        # NEW: Additional action types for multi-event edges
+                        'carries': team_carries,
+                        'dribbles': team_dribbles,
+                        'team_defense': team_defense,
+                        
+                        # Global context
                         'total_passes_in_window': total_passes_in_window,
                         'opp_counterpress_count': opp_counterpress[team],
                         'period': period,
+                        
+                        # NEW: Game state context
+                        'score_diff': score_diff,
+                        'match_progress': match_progress,
+                        'match_duration': match_duration,
                         
                         # --- REGRESSION LABELS (5) ---
                         'y_cum_xt': metrics['y_cum_xt'],
@@ -287,8 +364,9 @@ def get_rolling_windows(data_dict, match_id, window_size=5, stride=1):
                         'y_tempo': metrics['y_tempo'],
                         
                         # --- CLASSIFICATION LABELS ---
-                        'y_def_posture': metrics['y_def_posture'],  # 0/1/2
+                        'y_def_posture': metrics['y_def_posture'],
                         # y_off_style assigned in Pass 2
+                        'y_outcome': team_outcomes[team],  # SUITE NEW: 0=Loss, 1=Draw, 2=Win
                     }
                     windows.append(window_bundle)
             
@@ -296,7 +374,7 @@ def get_rolling_windows(data_dict, match_id, window_size=5, stride=1):
         window_id += 1
     
     # =====================================================================
-    # PASS 2: Assign offensive style from full distribution (balanced)
+    # PASS 2: Assign offensive style from full distribution
     # =====================================================================
     windows = assign_offensive_style_labels(windows)
         
@@ -305,7 +383,7 @@ def get_rolling_windows(data_dict, match_id, window_size=5, stride=1):
 # --- Test Block ---
 if __name__ == "__main__":
     from data_pipeline import fetch_match_data
-    from utils import encode_features
+    from utils import encode_features, encode_action_features
     
     match_id = 8658
     print(f"Fetching Match {match_id}...")
@@ -313,46 +391,25 @@ if __name__ == "__main__":
     
     if not data['passes'].empty:
         data['passes'] = encode_features(data['passes'])
+    if not data['carries'].empty:
+        data['carries'] = encode_action_features(data['carries'], 'carry')
+    if not data['dribbles'].empty:
+        data['dribbles'] = encode_action_features(data['dribbles'], 'dribble')
+    if not data['defense'].empty:
+        data['defense'] = encode_action_features(data['defense'], 'defense')
     
     print("Slicing windows...")
     windows = get_rolling_windows(data, match_id)
     
     print(f"\nGenerated {len(windows)} training samples.")
     
-    # --- Distribution Check ---
-    xt_vals = [w['y_cum_xt'] for w in windows]
-    tempo_vals = [w['y_tempo'] for w in windows]
-    vert_vals = [w['y_verticality'] for w in windows]
-    def_labels = [w['y_def_posture'] for w in windows]
-    off_labels = [w['y_off_style'] for w in windows]
-    
-    print(f"\n--- Target Distribution Check ---")
-    print(f"Cumulative xT: min={min(xt_vals):.4f}, max={max(xt_vals):.4f}, mean={np.mean(xt_vals):.4f}")
-    print(f"Tempo (p/min):  min={min(tempo_vals):.1f}, max={max(tempo_vals):.1f}, mean={np.mean(tempo_vals):.1f}")
-    print(f"Verticality:    min={min(vert_vals):.3f}, max={max(vert_vals):.3f}, mean={np.mean(vert_vals):.3f}")
-    
-    print(f"\n--- Classification Distribution ---")
-    print(f"Def Posture:    {dict(pd.Series(def_labels).value_counts().sort_index())}")
-    print(f"                (0=LowBlock, 1=MidBlock, 2=HighPress)")
-    print(f"Off Style:      {dict(pd.Series(off_labels).value_counts().sort_index())}")
-    print(f"                (0=Patient, 1=Balanced, 2=Counter)")
-    
-    # Verify balance
-    total = len(off_labels)
-    for cls_val, cls_name in [(0, 'Patient'), (1, 'Balanced'), (2, 'Counter')]:
-        count = off_labels.count(cls_val)
-        print(f"  {cls_name}: {count} ({count/total:.1%})")
-    
-    if len(windows) > 10:
-        w = windows[10] 
+    # Check new fields
+    if windows:
+        w = windows[10]
         print(f"\n--- Sample Window ID {w['window_id']} ({w['team_name']}) ---")
         print(f"Time: {w['start_time']} - {w['end_time']} min")
-        print(f"--- REGRESSION LABELS ---")
-        print(f"Cumulative xT:  {w['y_cum_xt']:.4f}")
-        print(f"Press Height:   {w['y_press_height']:.1f}")
-        print(f"Field Tilt:     {w['y_field_tilt']:.1%}")
-        print(f"Verticality:    {w['y_verticality']:.3f}")
-        print(f"Tempo:          {w['y_tempo']:.1f} passes/min")
-        print(f"--- CLASSIFICATION LABELS ---")
-        print(f"Def Posture:    {w['y_def_posture']} ({'LowBlock' if w['y_def_posture']==0 else 'MidBlock' if w['y_def_posture']==1 else 'HighPress'})")
-        print(f"Off Style:      {w['y_off_style']} ({'Patient' if w['y_off_style']==0 else 'Balanced' if w['y_off_style']==1 else 'Counter'})")
+        print(f"Score Diff: {w['score_diff']}")
+        print(f"Match Progress: {w['match_progress']:.3f}")
+        print(f"Carries: {len(w['carries'])} | Dribbles: {len(w['dribbles'])}")
+        print(f"Team Defense Actions: {len(w['team_defense'])}")
+        print(f"Cum xT (incl carries): {w['y_cum_xt']:.4f}")
