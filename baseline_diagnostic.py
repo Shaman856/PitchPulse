@@ -20,6 +20,32 @@ from torch_geometric.loader import DataLoader
 from preprocessing.dataset import TacticalDataset
 from models.model import TacticalGAT
 
+
+def match_level_split(dataset, train_ratio=0.8, seed=42):
+    """
+    Splits dataset by MATCH, not by window.
+    Must use identical seed/ratio as train.py to get the same split.
+    """
+    match_ids = []
+    for i in range(len(dataset)):
+        match_ids.append(dataset[i].match_id)
+    
+    unique_matches = sorted(set(match_ids))
+    rng = np.random.RandomState(seed)
+    rng.shuffle(unique_matches)
+    
+    n_train = int(len(unique_matches) * train_ratio)
+    train_matches = set(unique_matches[:n_train])
+    test_matches = set(unique_matches[n_train:])
+    
+    train_indices = [i for i, mid in enumerate(match_ids) if mid in train_matches]
+    test_indices = [i for i, mid in enumerate(match_ids) if mid in test_matches]
+    
+    print(f"Match-Level Split: {len(train_matches)} train / {len(test_matches)} test matches")
+    print(f"  Train windows: {len(train_indices)} | Test windows: {len(test_indices)}")
+    
+    return train_indices, test_indices
+
 # --- CONFIGURATION ---
 DATASET_PATH = "./data_v3"
 DATASET_NAME = "offline_mix_v4"   # Match your current dataset name
@@ -237,10 +263,8 @@ def main():
         window_size=5, stride=1, max_matches=MAX_MATCHES
     )
     
-    torch.manual_seed(42)
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    _, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
+    _, test_indices = match_level_split(dataset, train_ratio=0.8, seed=42)
+    test_dataset = torch.utils.data.Subset(dataset, test_indices)
     loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     
     # 2. Auto-detect dimensions
