@@ -77,6 +77,7 @@ python key_player.py --match_id 3869685     # Different match
     ├── window_slicer.py        # Rolling windows + tactical metric computation
     ├── dataset.py              # PyG InMemoryDataset builder
     └── graph_builder.py        # Window→Graph conversion (nodes, edges, globals)
+    └── sequence_dataset.py     # Sequence dataset for LSTM baseline
 ```
 
 

@@ -22,3 +22,4 @@ Best_models/
 *.png
 # Or un-comment the line below to ignore ALL pngs if you don't have static assets
 # *.png
+*.sh
