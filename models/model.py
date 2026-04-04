@@ -88,8 +88,6 @@ class TacticalGATLSTM(torch.nn.Module):
 
         # Offensive style classification: Patient / Balanced / Counter
         self.cls_off_head = Linear(64, num_off_classes)
-        self.cls_outcome_head = Linear(64, num_outcome_classes)
-
         # Apply principled weight initialisation
         self._init_weights()
 
